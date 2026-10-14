@@ -1,0 +1,3 @@
+# mediapipe pulls in opencv-contrib-python; do not also install opencv-python
+# (two OpenCV wheels in one environment overwrite each other's cv2 package).
+mediapipe==1.1.0
