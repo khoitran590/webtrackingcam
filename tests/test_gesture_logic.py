@@ -7,10 +7,13 @@ import numpy as np
 import pytest
 
 from gesture_logic import (
+    PINCH_RATIO,
     GestureVote,
+    HandPose,
     HandTracker,
     OneEuroFilter,
     classify_gesture,
+    classify_two_hands,
     finger_states,
     pinch_ratio,
     thumb_direction,
@@ -68,6 +71,8 @@ POSES = {
     "Peace / Victory": (False, True, True, False, False),
     "Rock On": (False, True, False, False, True),
     "Spider-Man / ILY": (True, True, False, False, True),
+    "Call Me": (True, False, False, False, True),
+    "L Shape": (True, True, False, False, False),
     "3 Fingers Up": (False, True, True, True, False),
 }
 
@@ -81,23 +86,36 @@ def test_synthetic_poses(expected, pose):
 
 def test_ok_sign():
     world = make_ok_sign()
-    assert pinch_ratio(world) < 0.3
+    assert pinch_ratio(world) < PINCH_RATIO
     assert classify_gesture(finger_states(world), pinch_ratio(world)) == "OK Sign"
 
 
 @pytest.mark.parametrize("pose", list(POSES.values()) + ["ok"])
-def test_rotation_scale_and_mirror_invariance(pose):
+def test_finger_states_survive_any_3d_rotation_scale_and_mirror(pose):
     """The spec's y_tip < y_pip test breaks when the hand rotates; ours must not."""
     base = make_ok_sign() if pose == "ok" else make_hand(*pose)
-    expected_states, expected_pinch = finger_states(base), pinch_ratio(base)
+    expected = finger_states(base)
     rng = np.random.default_rng(7)
     for _ in range(200):
         moved = transform(
             base, random_rotation(rng), scale=rng.uniform(0.5, 2.0),
             offset=rng.uniform(-1, 1, size=3), mirror=bool(rng.integers(2)),
         )
-        assert finger_states(moved) == expected_states
-        assert math.isclose(pinch_ratio(moved), expected_pinch, rel_tol=1e-9)
+        assert finger_states(moved) == expected
+
+
+def test_pinch_survives_in_plane_rotation_scale_and_mirror():
+    """Pinch is measured in the image, so it is invariant to anything that keeps the
+    hand facing the camera: in-plane rotation, zoom, position and mirroring."""
+    base = make_ok_sign()
+    expected = pinch_ratio(base)
+    rng = np.random.default_rng(3)
+    for _ in range(200):
+        a = rng.uniform(0, 2 * math.pi)
+        spin = np.array([[math.cos(a), -math.sin(a), 0], [math.sin(a), math.cos(a), 0], [0, 0, 1]])
+        moved = transform(base, spin, scale=rng.uniform(0.5, 4.0), offset=rng.uniform(-500, 500, size=3),
+                          mirror=bool(rng.integers(2)))
+        assert math.isclose(pinch_ratio(moved), expected, rel_tol=1e-9)
 
 
 @pytest.mark.parametrize("tip,expected", [
@@ -186,3 +204,216 @@ def test_tracker_equidistant_tracks_do_not_crash():
     tracker = HandTracker()
     tracker.update([(0.4, 0.5), (0.6, 0.5)])
     assert len(tracker.update([(0.5, 0.5)])) == 1
+
+
+# --- Two-hand gestures -------------------------------------------------------------
+# A 2D hand in image pixels (palm length 100), pointing up (-y), thumb on the +x side.
+THUMB_2D = {True: [(25, -20), (45, -40), (70, -55), (95, -65)], False: [(25, -20), (40, -45), (35, -65), (15, -80)]}
+FINGERS_2D = [  # MCP, then (extended, curled) PIP/DIP/TIP for index, middle, ring, pinky
+    ((30, -95), [(33, -135), (35, -160), (37, -182)], [(33, -120), (30, -100), (28, -88)]),
+    ((0, -100), [(0, -145), (0, -172), (0, -195)], [(0, -125), (-2, -105), (-3, -92)]),
+    ((-25, -95), [(-27, -135), (-28, -160), (-29, -180)], [(-27, -118), (-26, -100), (-25, -88)]),
+    ((-45, -85), [(-50, -115), (-53, -135), (-55, -152)], [(-48, -105), (-46, -92), (-44, -80)]),
+]
+OPEN, FIST, THUMB_ONLY, L_SHAPE = (True,) * 5, (False,) * 5, (True, False, False, False, False), (True, True, False, False, False)
+
+
+def hand_2d(states, rotate=0.0, mirror=False, at=(0.0, 0.0)):
+    """Template hand, mirrored, then rotated clockwise on screen by `rotate` degrees, then moved."""
+    pts = [(0.0, 0.0)] + THUMB_2D[states[0]]
+    for (mcp, ext, curl), up in zip(FINGERS_2D, states[1:]):
+        pts += [mcp] + (ext if up else curl)
+    if mirror:
+        pts = [(-x, y) for x, y in pts]
+    c, s = math.cos(math.radians(rotate)), math.sin(math.radians(rotate))
+    return [(x * c - y * s + at[0], x * s + y * c + at[1]) for x, y in pts]
+
+
+def pose(states, gesture="", **kwargs):
+    return HandPose(hand_2d(states, **kwargs), list(states), gesture)
+
+
+def mirrored(p):
+    return HandPose([(-x, y) for x, y in p.points], p.fingers, p.gesture)
+
+
+def heart():
+    a = hand_2d(THUMB_ONLY, at=(-150, 150))
+    a[4], a[8] = (-8, 40), (-8, -60)  # thumb tips meet at the bottom, index tips above them
+    left = HandPose(a, list(THUMB_ONLY), "Thumb Out")
+    return left, mirrored(left)
+
+
+def frame():
+    # Lower-left L, and an upper-right L rotated 180 degrees: a camera frame.
+    return pose(L_SHAPE, "L Shape"), pose(L_SHAPE, "L Shape", rotate=180, at=(150, -250))
+
+
+def time_out():
+    level = pose(OPEN, "Open Palm", rotate=90, at=(0, 0))  # fingers pointing right
+    cx = sum(level.points[i][0] for i in (0, 5, 9, 13, 17)) / 5
+    cy = sum(level.points[i][1] for i in (0, 5, 9, 13, 17)) / 5
+    upright = pose(OPEN, "Open Palm", at=(cx + 10, cy + 195))  # middle tip just under the flat palm
+    return upright, level
+
+
+def x_sign():
+    left = pose(FIST, "Fist", rotate=-30, at=(-60, 0))  # leaning up and outwards
+    return left, mirrored(left)
+
+
+def prayer():
+    left = pose(OPEN, "Open Palm", at=(-10, 0))
+    return left, mirrored(left)
+
+
+SCENES = {"Heart": heart, "Frame": frame, "Time Out": time_out, "X Sign": x_sign, "Prayer": prayer}
+
+
+@pytest.mark.parametrize("expected", SCENES)
+def test_two_hand_gestures(expected):
+    a, b = SCENES[expected]()
+    assert classify_two_hands(a, b) == expected
+    assert classify_two_hands(b, a) == expected  # hand order must not matter
+
+
+@pytest.mark.parametrize("expected", SCENES)
+def test_two_hand_gestures_ignore_zoom_position_and_mirroring(expected):
+    """The live view is mirrored and cameras differ in resolution."""
+    a, b = SCENES[expected]()
+    for scale, dx, dy, flip in [(0.3, 0, 0, False), (4.0, 900, 400, False), (1.0, 0, 0, True), (2.5, -300, 50, True)]:
+        def move(p):
+            return HandPose([((-x if flip else x) * scale + dx, y * scale + dy) for x, y in p.points], p.fingers, p.gesture)
+        assert classify_two_hands(move(a), move(b)) == expected
+
+
+def test_heart_needs_touching_tips_and_index_above_thumbs():
+    a, b = heart()
+    apart = HandPose([(x - 80, y) for x, y in a.points], a.fingers, a.gesture)
+    assert classify_two_hands(apart, b) != "Heart"
+    flipped = HandPose([(x, -y) for x, y in a.points], a.fingers, a.gesture)  # upside-down heart
+    assert classify_two_hands(flipped, mirrored(flipped)) != "Heart"
+
+
+def test_two_touching_fists_are_not_a_heart():
+    a, b = heart()
+    fists = [HandPose(h.points, list(FIST), "Fist") for h in (a, b)]
+    assert classify_two_hands(*fists) == "Double Fist"
+
+
+def test_side_by_side_l_shapes_are_double_not_frame():
+    left = pose(L_SHAPE, "L Shape", mirror=True, at=(-200, 0))
+    right = pose(L_SHAPE, "L Shape", at=(200, 0))
+    assert classify_two_hands(left, right) == "Double L Shape"
+
+
+def test_two_upright_open_hands_side_by_side_are_not_time_out_or_prayer():
+    left = pose(OPEN, "Open Palm", mirror=True, at=(-200, 0))
+    right = pose(OPEN, "Open Palm", at=(200, 0))
+    assert classify_two_hands(left, right) == "Double Open Palm"
+
+
+def test_upright_fists_are_not_x_sign():
+    left = pose(FIST, "Fist", at=(-60, 0))
+    assert classify_two_hands(left, mirrored(left)) == "Double Fist"
+
+
+@pytest.mark.parametrize("gesture", ["Spider-Man / ILY", "Thumbs Up", "OK Sign", "Rock On", "Call Me"])
+def test_double_named_gestures(gesture):
+    left = pose(OPEN, gesture, mirror=True, at=(-400, 0))
+    right = pose(OPEN, gesture, at=(400, 0))
+    assert classify_two_hands(left, right) == f"Double {gesture}"
+
+
+def test_no_double_for_different_gestures_or_finger_counts():
+    assert classify_two_hands(pose(OPEN, "Spider-Man / ILY", at=(-400, 0)), pose(OPEN, "Rock On", at=(400, 0))) is None
+    assert classify_two_hands(pose(OPEN, "2 Fingers Up", at=(-400, 0)), pose(OPEN, "2 Fingers Up", at=(400, 0))) is None
+
+
+def test_two_hands_degenerate_does_not_crash():
+    flat = HandPose([(0.0, 0.0)] * 21, [False] * 5, "Fist")
+    assert classify_two_hands(flat, flat) is None
+
+
+# Near misses: each scene breaks (mainly) one rule of a two-hand gesture, so every
+# threshold in classify_two_hands is needed by at least one test.
+def moved(p, dx=0.0, dy=0.0):
+    return HandPose([(x + dx, y + dy) for x, y in p.points], p.fingers, p.gesture)
+
+
+def with_point(p, i, xy):
+    pts = list(p.points)
+    pts[i] = xy
+    return HandPose(pts, p.fingers, p.gesture)
+
+
+def test_heart_needs_wrists_apart():
+    a, b = heart()
+    a = with_point(a, 0, (-40, 120))  # wrists nearly together: hands pressed, not a heart
+    assert classify_two_hands(a, mirrored(a)) != "Heart"
+
+
+def test_frame_needs_opposite_fingers():
+    a, b = frame()
+    sideways_index = with_point(b, 8, (b.points[5][0] + 100, b.points[5][1]))
+    assert classify_two_hands(a, sideways_index) != "Frame"
+
+
+def test_frame_needs_opposite_hands():
+    a, b = frame()
+    tilted = with_point(b, 0, (b.points[9][0] + 100, b.points[9][1]))  # wrist->knuckles now sideways
+    assert classify_two_hands(a, tilted) != "Frame"
+
+
+def test_frame_needs_hands_near_each_other():
+    a, b = frame()
+    assert classify_two_hands(a, moved(b, 2000, -2000)) != "Frame"
+
+
+def test_time_out_needs_fingertips_at_the_palm():
+    upright, level = time_out()
+    assert classify_two_hands(moved(upright, 0, 400), level) != "Time Out"
+
+
+def test_time_out_needs_one_upright_and_one_level_hand():
+    upright, level = time_out()
+    both_level = pose(OPEN, "Open Palm", rotate=90, at=upright.points[0])
+    assert classify_two_hands(both_level, level) != "Time Out"
+    # Two upright hands stacked, lower fingertips on the upper palm: not a T either.
+    top = pose(OPEN, "Open Palm", at=(0, -300))
+    centre = [sum(top.points[i][k] for i in (0, 5, 9, 13, 17)) / 5 for k in (0, 1)]
+    bottom = pose(OPEN, "Open Palm", at=(centre[0], centre[1] + 195))
+    assert classify_two_hands(bottom, top) != "Time Out"
+
+
+def test_x_sign_needs_hands_pointing_up():
+    left = pose(FIST, "Fist", rotate=-150, at=(-60, 0))  # leaning outwards but pointing down
+    assert classify_two_hands(left, mirrored(left)) != "X Sign"
+
+
+def test_x_sign_needs_hands_close_together():
+    left = pose(FIST, "Fist", rotate=-30, at=(-400, 0))  # arms raised in a wide V, not crossed
+    assert classify_two_hands(left, mirrored(left)) != "X Sign"
+
+
+def test_prayer_needs_parallel_upright_hands():
+    a = pose(OPEN, "Open Palm", rotate=20, at=(-67, 0))  # slight V, fingertips touching
+    assert classify_two_hands(a, mirrored(a)) != "Prayer"
+    down = pose(OPEN, "Open Palm", rotate=180, at=(-10, 0))
+    assert classify_two_hands(down, mirrored(down)) != "Prayer"
+
+
+def test_prayer_needs_hands_pressed_together():
+    a = pose(OPEN, "Open Palm", at=(-10, 0))
+    assert classify_two_hands(a, moved(mirrored(a), 0, 120)) != "Prayer"  # one hand lower
+
+
+def test_open_hands_rotated_apart_are_not_a_frame():
+    """Found on a real photo: an upright and an upside-down open hand read as Frame."""
+    a = pose(OPEN, "Open Palm")
+    b = pose(OPEN, "Open Palm", rotate=180, at=(150, -250))
+    assert classify_two_hands(a, b) != "Frame"
+
+
+def test_hands_without_gesture_names_are_not_doubled():
+    assert classify_two_hands(pose(OPEN, "", at=(-400, 0)), pose(OPEN, "", at=(400, 0))) is None

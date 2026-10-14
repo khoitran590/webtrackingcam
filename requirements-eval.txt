@@ -1,0 +1,5 @@
+# Only for tools/evaluate_hagrid.py (reads HaGRID parquet shards over HTTP).
+-r requirements.txt
+pyarrow==26.0.0
+fsspec==2026.9.0
+aiohttp==3.14.5

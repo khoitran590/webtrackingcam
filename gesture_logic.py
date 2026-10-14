@@ -1,39 +1,49 @@
 """Gesture classification and smoothing, independent of the camera, OpenCV and MediaPipe.
 
-A hand is a sequence of 21 ``(x, y, z)`` points in MediaPipe's landmark order.
+A hand is a sequence of 21 points in MediaPipe's landmark order.
 Finger states are computed from MediaPipe's *world* landmarks (metric 3D, centred on
 the hand). They only compare 3D distances, so they do not depend on hand rotation,
 palm-vs-back orientation, handedness, or distance from the camera.
+Everything that relates two points that may touch (the OK-sign pinch) or two hands
+to each other uses image points in pixels, because world landmarks are centred on
+each hand separately and their depth estimates are too noisy for fingertip contact.
+
+Thresholds were calibrated on 1,700 photos from the HaGRID v2 test split (100 per
+class) and checked on a held-out 1,700 from other shards; see tools/evaluate_hagrid.py.
 """
 
 import math
-from collections import Counter, deque
+from collections import Counter, deque, namedtuple
 
 WRIST = 0
 THUMB_MCP, THUMB_TIP = 2, 4
-INDEX_TIP = 8
-MIDDLE_MCP = 9
+INDEX_MCP, INDEX_TIP = 5, 8
+MIDDLE_MCP, MIDDLE_TIP = 9, 12
+RING_MCP = 13
 PINKY_MCP = 17
 FINGER_TIPS = (8, 12, 16, 20)  # index, middle, ring, pinky
 FINGER_PIPS = (6, 10, 14, 18)
+PALM_POINTS = (0, 5, 9, 13, 17)
 
-# Thresholds sit midway in the gap measured on the sample images in
-# tests/test_sample_images.py, both as-is and mirrored (96 fingers, 24 thumbs).
-# Wrist->tip over wrist->PIP: extended fingers measured >= 1.33, curled <= 1.16.
-FINGER_EXTENSION_RATIO = 1.25
-# Thumb tip -> pinky knuckle, in palm lengths: extended >= 0.98, tucked <= 0.78.
-THUMB_EXTENSION_RATIO = 0.88
-# Thumb tip -> index tip, in palm lengths, for the OK sign. Not calibrated on real
-# OK-sign images. A fist also measured as low as 0.175, so distance alone cannot tell
-# a pinch from a fist; it is only meaningful together with the finger states.
-PINCH_RATIO = 0.3
-# A thumb within 50 degrees of vertical counts as pointing up/down.
-THUMB_VERTICAL_COS = math.cos(math.radians(50))
+# Wrist->tip over wrist->PIP (3D) for index, middle, ring, pinky: 97-99% balanced
+# accuracy per finger on ~3,600 HaGRID fingers. The pinky, the shortest finger, is
+# often left slightly bent when "extended" (e.g. Call Me), so its cutoff is lower.
+FINGER_EXTENSION_RATIOS = (1.25, 1.25, 1.25, 1.17)
+# Thumb tip -> ring knuckle (3D), in palm lengths. 97% balanced accuracy on HaGRID.
+# (Tip -> pinky knuckle > 0.88, chosen from 10 photos, let 22% of fists read as Thumbs Up.)
+THUMB_EXTENSION_RATIO = 0.80
+# Thumb tip -> index tip in the image, in image palm lengths. Real OK signs measured a
+# median of 0.35; open hands that are not OK signs stay above this for 99% of cases.
+# Distance alone cannot tell a pinch from a fist, so it is only used with finger states.
+PINCH_RATIO = 0.42
+# A thumb within 60 degrees of vertical counts as pointing up/down.
+THUMB_VERTICAL_COS = math.cos(math.radians(60))
 
 
-def palm_length(world):
-    """Wrist to middle-finger knuckle: the unit that makes the ratios scale-free."""
-    return math.dist(world[WRIST], world[MIDDLE_MCP])
+def palm_length(points):
+    """Wrist to middle-finger knuckle: the unit that makes the ratios scale-free.
+    Works on 3D world points or 2D image points."""
+    return math.dist(points[WRIST], points[MIDDLE_MCP])
 
 
 def finger_states(world):
@@ -41,19 +51,19 @@ def finger_states(world):
     palm = palm_length(world)
     if palm == 0:
         return [False] * 5
-    # A folded thumb lies across the palm towards the pinky; an extended one points away.
-    thumb = math.dist(world[THUMB_TIP], world[PINKY_MCP]) / palm > THUMB_EXTENSION_RATIO
+    # A folded thumb lies across the palm towards the ring finger; an extended one points away.
+    thumb = math.dist(world[THUMB_TIP], world[RING_MCP]) / palm > THUMB_EXTENSION_RATIO
     fingers = [
-        math.dist(world[WRIST], world[tip]) > FINGER_EXTENSION_RATIO * math.dist(world[WRIST], world[pip])
-        for tip, pip in zip(FINGER_TIPS, FINGER_PIPS)
+        math.dist(world[WRIST], world[tip]) > ratio * math.dist(world[WRIST], world[pip])
+        for tip, pip, ratio in zip(FINGER_TIPS, FINGER_PIPS, FINGER_EXTENSION_RATIOS)
     ]
     return [thumb] + fingers
 
 
-def pinch_ratio(world):
-    """Thumb-tip to index-tip distance in palm lengths."""
-    palm = palm_length(world)
-    return math.dist(world[THUMB_TIP], world[INDEX_TIP]) / palm if palm else math.inf
+def pinch_ratio(points_px):
+    """Thumb-tip to index-tip distance in the image, in image palm lengths (only x, y are used)."""
+    palm = math.dist(points_px[WRIST][:2], points_px[MIDDLE_MCP][:2])
+    return math.dist(points_px[THUMB_TIP][:2], points_px[INDEX_TIP][:2]) / palm if palm else math.inf
 
 
 def thumb_direction(points_px):
@@ -99,7 +109,105 @@ def classify_gesture(fingers, pinch, thumb_dir="up"):
         return "Rock On"
     if fingers == [True, True, False, False, True]:
         return "Spider-Man / ILY"
+    if fingers == [True, False, False, False, True]:
+        return "Call Me"
+    if fingers == [True, True, False, False, False]:
+        return "L Shape"
     return f"{total_fingers} Finger{'' if total_fingers == 1 else 's'} Up"
+
+
+# One hand as seen by the two-hand classifier: image points in pixels, finger states,
+# and that hand's single-hand gesture for this frame.
+HandPose = namedtuple("HandPose", "points fingers gesture")
+
+# Two-hand thresholds, in image palm lengths unless noted. The comments give the
+# median [10th, 90th percentile] measured on HaGRID photos of that gesture.
+HEART_TIP_GAP = 0.6  # thumb-thumb 0.15-0.21 [0.10, 0.38]; index-index 0.09-0.17 [0.03, 0.40]
+HEART_MIN_RISE = 0.3  # index tips above thumb tips by 0.84-0.89 [0.64, 1.09]
+HEART_MIN_WRIST_GAP = 1.5  # 2.6-2.8 [2.38, 2.98]; prayer hands, which also touch, measured 0.88 [0.66, 1.19]
+FRAME_MAX_COS = -0.8  # index, thumb directions: -0.99, -1.00 [p90 -0.95] (exactly opposite)
+FRAME_MAX_HAND_COS = -0.6  # wrist->knuckle directions: -0.96 [p90 -0.83]; hearts 0.47 / -0.01
+FRAME_MAX_GAP = 3.0  # thumb-thumb 1.55 [1.32, 1.73]
+TIMEOUT_MAX_TIP_TO_PALM = 1.0  # upright hand's middle tip to the flat hand's palm: 0.42 [0.23, 0.58]
+CROSS_MIN_OUTWARD = 0.3  # both hands tilt away from the centre: 0.60 [0.46, 0.80]; all others <= 0.02 (p90)
+CROSS_MIN_RISE = 0.3  # wrist->knuckles pointing upwards: 0.71 [0.51, 0.81]
+CROSS_MAX_WRIST_GAP = 2.5  # 1.44 [1.05, 1.88]
+PRAYER_MIN_HAND_COS = 0.8  # 0.98 [0.93, 1.00]
+PRAYER_MAX_TIP_GAP = 0.6  # middle tips 0.11 [0.05, 0.33]
+UPRIGHT_COS = 0.7  # pointing within ~45 degrees of vertical
+LEVEL_COS = 0.5  # pointing within 60 degrees of horizontal
+
+
+def _direction(points, a, b):
+    dx, dy = points[b][0] - points[a][0], points[b][1] - points[a][1]
+    n = math.hypot(dx, dy)
+    return (dx / n, dy / n) if n else (0.0, 0.0)
+
+
+def _cos(u, v):
+    return u[0] * v[0] + u[1] * v[1]
+
+
+def classify_two_hands(a, b):
+    """Name the gesture two HandPoses make together, or None.
+
+    Spatial gestures come first; otherwise two hands showing the same named
+    single-hand gesture give "Double <gesture>" (e.g. "Double Spider-Man / ILY").
+    """
+    palm = (palm_length(a.points) + palm_length(b.points)) / 2
+    if palm == 0:
+        return None
+
+    def gap(i):  # distance between the two hands' landmark i
+        return math.dist(a.points[i][:2], b.points[i][:2]) / palm
+
+    def facing(i, j):  # cosine between the two hands' i->j directions
+        return _cos(_direction(a.points, i, j), _direction(b.points, i, j))
+
+    up = (0.0, -1.0)  # image y grows downwards
+    thumbs = a.fingers[0] and b.fingers[0]
+    four_fingers = all(a.fingers[1:]) and all(b.fingers[1:])
+    l_shapes = thumbs and (a.fingers[1] or b.fingers[1]) and not any(all(h.fingers[2:]) for h in (a, b))
+
+    # Heart: thumb tips touch at the bottom, index tips touch above them, wrists apart.
+    rise = (a.points[THUMB_TIP][1] + b.points[THUMB_TIP][1] - a.points[INDEX_TIP][1] - b.points[INDEX_TIP][1]) / 2 / palm
+    if (thumbs and gap(THUMB_TIP) < HEART_TIP_GAP and gap(INDEX_TIP) < HEART_TIP_GAP
+            and rise > HEART_MIN_RISE and gap(WRIST) > HEART_MIN_WRIST_GAP):
+        return "Heart"
+
+    # Frame: two L shapes, one rotated 180 degrees from the other, at opposite corners.
+    # The index at a frame corner is often bent enough to read as curled, so one is enough;
+    # open hands (middle, ring and pinky out) never form one, but otherwise look alike.
+    if (l_shapes and facing(INDEX_MCP, INDEX_TIP) < FRAME_MAX_COS and facing(THUMB_MCP, THUMB_TIP) < FRAME_MAX_COS
+            and facing(WRIST, MIDDLE_MCP) < FRAME_MAX_HAND_COS and gap(THUMB_TIP) < FRAME_MAX_GAP):
+        return "Frame"
+
+    # Time Out: one flat hand level, the other upright with its fingertips at the flat palm.
+    if four_fingers:
+        for upright, level in ((a, b), (b, a)):
+            if (abs(_cos(_direction(upright.points, MIDDLE_MCP, MIDDLE_TIP), up)) > UPRIGHT_COS
+                    and abs(_cos(_direction(level.points, MIDDLE_MCP, MIDDLE_TIP), up)) < LEVEL_COS):
+                palm_centre = [sum(level.points[i][k] for i in PALM_POINTS) / len(PALM_POINTS) for k in (0, 1)]
+                if math.dist(upright.points[MIDDLE_TIP][:2], palm_centre) / palm < TIMEOUT_MAX_TIP_TO_PALM:
+                    return "Time Out"
+
+    # X Sign (crossed arms): forearms cross, so each hand leans away from the other.
+    centre_x = (a.points[WRIST][0] + b.points[WRIST][0]) / 2
+    outward = min(math.copysign(1, h.points[WRIST][0] - centre_x) * _direction(h.points, WRIST, MIDDLE_MCP)[0]
+                  for h in (a, b))
+    rising = min(_cos(_direction(h.points, WRIST, MIDDLE_MCP), up) for h in (a, b))
+    if outward > CROSS_MIN_OUTWARD and rising > CROSS_MIN_RISE and gap(WRIST) < CROSS_MAX_WRIST_GAP:
+        return "X Sign"
+
+    # Prayer: flat hands pressed together, pointing up. (Parallel hands with touching
+    # fingertips also have their wrists together, so no separate wrist check is needed.)
+    if (four_fingers and facing(WRIST, MIDDLE_MCP) > PRAYER_MIN_HAND_COS and rising > UPRIGHT_COS
+            and gap(MIDDLE_TIP) < PRAYER_MAX_TIP_GAP):
+        return "Prayer"
+
+    if a.gesture and a.gesture == b.gesture and not a.gesture[0].isdigit():  # skip "N Fingers Up"
+        return f"Double {a.gesture}"
+    return None
 
 
 class GestureVote:

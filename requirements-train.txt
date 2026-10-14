@@ -1,0 +1,3 @@
+# Only for tools/train_gesture_model.py (the app itself needs only numpy to run the model).
+-r requirements-eval.txt
+scikit-learn==1.9.1

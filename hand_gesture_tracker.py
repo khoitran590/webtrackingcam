@@ -1,7 +1,7 @@
 """Real-time webcam hand tracking and gesture recognition (MediaPipe Tasks + OpenCV).
 
-Usage:  python hand_gesture_tracker.py [--camera 0] [--width 1280] [--height 720]
-Quit:   press q or Esc, or close the window.
+Usage:  python hand_gesture_tracker.py [--camera 0] [--width 1280] [--height 720] [--rules-only]
+Keys:   m switches the learned model on/off (rules only); q or Esc quits, as does closing the window.
 """
 
 import argparse
@@ -21,12 +21,16 @@ import mediapipe as mp
 
 from gesture_logic import (
     WRIST,
+    GestureVote,
+    HandPose,
     HandTracker,
     classify_gesture,
+    classify_two_hands,
     finger_states,
     pinch_ratio,
     thumb_direction,
 )
+from gesture_model import DEFAULT_CLASSIFIER_PATH, GestureModel, combine, hand_features
 
 MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
 MODEL_SHA256 = "fbc2a30080c3c557093b5ddfc334698132eb341044ccee322ccf8bcf3607cde1"
@@ -35,10 +39,17 @@ DEFAULT_MODEL_PATH = Path(__file__).resolve().parent / "models" / "hand_landmark
 WINDOW_NAME = "MediaPipe Hand Gesture Tracker"
 HAND_CONNECTIONS = [(c.start, c.end) for c in mp.tasks.vision.HandLandmarksConnections.HAND_CONNECTIONS]
 FINGERTIPS = {4, 8, 12, 16, 20}
-HUD_HEIGHT = 45  # top strip kept free of hand labels
+HUD_HEIGHT = 85  # top strip (status line + two-hand banner) kept free of hand labels
 MAX_CONSECUTIVE_READ_FAILURES = 60  # ~2 s at 30 fps; cameras often drop frames while warming up
+# MediaPipe confidence needed to report a hand. On held-out HaGRID photos, 0.3/0.3 instead of
+# 0.7/0.5 found a hand in 96.0% of gesture photos instead of 89.6%, both hands of a two-hand
+# gesture in 86% instead of 67% (Prayer 26% -> 52%), with no extra two-hand false alarms. About
+# 0.3% of photos gained a phantom "hand" (a carpet, a dark sleeve); at 0.2 that grew to faces
+# and kettles. Still photos cannot show whether a phantom would persist through video tracking.
+MIN_HAND_DETECTION_CONFIDENCE = 0.3
+MIN_HAND_PRESENCE_CONFIDENCE = 0.3
 
-GREEN, WHITE, BLACK, ORANGE = (0, 255, 0), (255, 255, 255), (0, 0, 0), (0, 165, 255)
+GREEN, WHITE, BLACK, ORANGE, MAGENTA = (0, 255, 0), (255, 255, 255), (0, 0, 0), (0, 165, 255), (255, 0, 255)
 
 
 def _sha256(path):
@@ -71,14 +82,15 @@ def ensure_model(path=DEFAULT_MODEL_PATH):
     return path
 
 
-def create_landmarker(model_path, num_hands=2):
+def create_landmarker(model_path, num_hands=2, min_detection=MIN_HAND_DETECTION_CONFIDENCE,
+                      min_presence=MIN_HAND_PRESENCE_CONFIDENCE):
     vision = mp.tasks.vision
     options = vision.HandLandmarkerOptions(
         base_options=mp.tasks.BaseOptions(model_asset_path=str(model_path)),
         running_mode=vision.RunningMode.VIDEO,
         num_hands=num_hands,
-        min_hand_detection_confidence=0.7,
-        min_hand_presence_confidence=0.5,
+        min_hand_detection_confidence=min_detection,
+        min_hand_presence_confidence=min_presence,
         min_tracking_confidence=0.5,
     )
     return vision.HandLandmarker.create_from_options(options)
@@ -97,21 +109,38 @@ def user_handedness(model_label, mirrored):
 class HandReading:
     track_id: int
     handedness: str  # the user's actual hand
-    gesture: str  # majority-voted label shown on screen
+    gesture: str  # majority-voted label shown on screen; None = not making a gesture
     raw_gesture: str  # this frame's label
     fingers: list  # [thumb, index, middle, ring, pinky]
-    pinch: float  # thumb-to-index tip distance in palm lengths
+    pinch: float  # thumb-to-index tip distance in image palm lengths
     points_px: list  # 21 smoothed (x, y) image points in pixels
+    rule_gesture: str = None  # this frame's label from the rules alone
+    model_guess: tuple = None  # (class, confidence) from the learned model, when it is in use
+    world_points: list = None  # MediaPipe's 21 world points (metres)
+    image_label: str = None  # MediaPipe's handedness for this (possibly mirrored) frame
+
+
+@dataclass
+class FrameReading:
+    hands: list  # one HandReading per detected hand
+    two_hand_gesture: str = None  # majority-voted gesture made with both hands, if any
 
 
 class GesturePipeline:
-    """Runs the landmarker on one frame and turns its output into per-hand readings."""
+    """Runs the landmarker on one frame and turns its output into per-hand readings.
 
-    def __init__(self, landmarker, mirrored=True, tracker=None):
+    With a GestureModel, each hand's label combines the rules with the model (see
+    gesture_model.combine); ``use_model`` switches back to the rules alone."""
+
+    def __init__(self, landmarker, mirrored=True, tracker=None, model=None):
         self.landmarker = landmarker
         self.mirrored = mirrored
         self.tracker = tracker or HandTracker()
+        self.model = model
+        self.use_model = model is not None
         self._last_timestamp_ms = -1
+        self._pair = None  # track ids of the two hands the pair vote belongs to
+        self._pair_vote = None
 
     def process(self, frame_bgr, t_seconds):
         h, w = frame_bgr.shape[:2]
@@ -130,8 +159,14 @@ class GesturePipeline:
         for track, image_pts, world_pts, label in zip(tracks, image_hands, world_hands, labels, strict=True):
             points_px = [(x * w, y * h) for x, y, _ in track.smoother(image_pts, t_seconds)]
             fingers = finger_states(world_pts)
-            pinch = pinch_ratio(world_pts)
-            raw = classify_gesture(fingers, pinch, thumb_direction(points_px))
+            pinch = pinch_ratio(points_px)
+            thumb_dir = thumb_direction(points_px)
+            rule = raw = classify_gesture(fingers, pinch, thumb_dir)
+            guess = None
+            if self.model is not None and self.use_model:
+                # The model needs the label as MediaPipe saw it (what the hand looks like in this image).
+                guess = self.model.predict(hand_features(points_px, world_pts, label))
+                raw = combine(rule, fingers, thumb_dir, *guess, self.model.thresholds)
             readings.append(HandReading(
                 track_id=track.id,
                 handedness=user_handedness(label, self.mirrored),
@@ -140,8 +175,22 @@ class GesturePipeline:
                 fingers=fingers,
                 pinch=pinch,
                 points_px=points_px,
+                rule_gesture=rule,
+                model_guess=guess,
+                world_points=world_pts,
+                image_label=label,
             ))
-        return readings
+        return FrameReading(readings, self._two_hand_gesture(readings))
+
+    def _two_hand_gesture(self, readings):
+        if len(readings) != 2:
+            self._pair = None
+            return None
+        pair = {r.track_id for r in readings}
+        if pair != self._pair:  # different hands: start a fresh vote
+            self._pair, self._pair_vote = pair, GestureVote(self.tracker.vote_size)
+        a, b = (HandPose(r.points_px, r.fingers, r.raw_gesture) for r in readings)
+        return self._pair_vote.update(classify_two_hands(a, b))
 
 
 def draw_text(frame, text, origin, color=GREEN, scale=0.8):
@@ -149,7 +198,9 @@ def draw_text(frame, text, origin, color=GREEN, scale=0.8):
     cv2.putText(frame, text, origin, cv2.FONT_HERSHEY_SIMPLEX, scale, color, 2, cv2.LINE_AA)
 
 
-def draw_hand(frame, reading):
+def draw_hand(frame, reading, placed=None):
+    """Draw one hand and its label. Pass the same ``placed`` list for every hand in a
+    frame so labels of hands that are close together do not overlap."""
     h, w = frame.shape[:2]
     pts = [(int(round(x)), int(round(y))) for x, y in reading.points_px]
     for a, b in HAND_CONNECTIONS:
@@ -157,9 +208,14 @@ def draw_hand(frame, reading):
     for i, p in enumerate(pts):
         cv2.circle(frame, p, 6 if i in FINGERTIPS else 4, ORANGE if i in FINGERTIPS else GREEN, -1, cv2.LINE_AA)
 
-    text = f"{reading.handedness}: {reading.gesture}"
+    # A hand that is not making a gesture keeps its skeleton and Left/Right, without a name.
+    text = f"{reading.handedness}: {reading.gesture}" if reading.gesture else reading.handedness
     (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
-    draw_text(frame, text, label_origin(pts, (tw, th), (w, h), top=HUD_HEIGHT))
+    origin = label_origin(pts, (tw, th), (w, h), top=HUD_HEIGHT)
+    if placed is not None:
+        origin = avoid_labels(origin, (tw, th), (w, h), placed, top=HUD_HEIGHT)
+        placed.append(label_box(origin, (tw, th)))
+    draw_text(frame, text, origin)
 
 
 def label_origin(pts, text_size, frame_size, margin=10, gap=15, top=10):
@@ -176,8 +232,42 @@ def label_origin(pts, text_size, frame_size, margin=10, gap=15, top=10):
     return int(x), int(y)
 
 
-def draw_hud(frame, fps):
-    draw_text(frame, f"{fps:4.1f} FPS   q / Esc: quit", (10, 30), WHITE, 0.6)
+def label_box(origin, text_size, pad=6):
+    """Screen rectangle (x0, y0, x1, y1) covered by a label drawn at ``origin``."""
+    (x, y), (tw, th) = origin, text_size
+    return x - pad, y - th - pad, x + tw + pad, y + pad
+
+
+def avoid_labels(origin, text_size, frame_size, placed, margin=10, top=10):
+    """Slide a label up, or else down, in whole label heights until it clears the
+    labels already ``placed``, staying on screen. Returns ``origin`` if nothing fits."""
+    def clashes(o):
+        x0, y0, x1, y1 = label_box(o, text_size)
+        return any(x0 < bx1 and bx0 < x1 and y0 < by1 and by0 < y1 for bx0, by0, bx1, by1 in placed)
+
+    th, h = text_size[1], frame_size[1]
+    origin = (origin[0], min(max(origin[1], th + top), h - margin))
+    step = th + 14  # taller than a label box (th + 2 * pad), so neighbours never touch
+    for direction in (-1, 1):
+        for k in range(len(placed) + 1):
+            candidate = (origin[0], origin[1] + direction * k * step)
+            if th + top <= candidate[1] <= h - margin and not clashes(candidate):
+                return candidate
+    return origin
+
+
+def draw_hud(frame, fps, two_hand_gesture=None, mode=None):
+    """``mode``: None when there is no learned model, else whether it is in use."""
+    status = f"{fps:4.1f} FPS   q / Esc: quit"
+    if mode is not None:
+        status += f"   m: model {'ON (rules + model)' if mode else 'OFF (rules only)'}"
+    draw_text(frame, status, (10, 30), WHITE, 0.6)
+    if two_hand_gesture:
+        text = f"Both hands: {two_hand_gesture}"
+        (tw, _), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 2)
+        scale = min(1.0, (frame.shape[1] - 20) / tw)  # shrink to fit narrow frames
+        tw = int(tw * scale)
+        draw_text(frame, text, ((frame.shape[1] - tw) // 2, 70), MAGENTA, scale)
 
 
 def open_camera(index, width, height):
@@ -215,20 +305,23 @@ def run(cap, pipeline, max_frames=None):
 
         frame = cv2.flip(frame, 1)  # mirror view; GesturePipeline(mirrored=True) corrects the labels
         now = time.monotonic()
-        readings = pipeline.process(frame, now)
-        for reading in readings:
-            draw_hand(frame, reading)
+        result = pipeline.process(frame, now)
+        placed = []
+        for reading in result.hands:
+            draw_hand(frame, reading, placed)
         if frames:
             instant = 1.0 / max(now - last, 1e-6)
             fps = instant if fps == 0 else 0.9 * fps + 0.1 * instant
         last = now
-        draw_hud(frame, fps)
+        draw_hud(frame, fps, result.two_hand_gesture, pipeline.use_model if pipeline.model else None)
 
         cv2.imshow(WINDOW_NAME, frame)
         frames += 1
         key = cv2.waitKey(1) & 0xFF
         if key in (ord("q"), 27):
             break
+        if key == ord("m") and pipeline.model is not None:
+            pipeline.use_model = not pipeline.use_model
         # Closing the window does not send a key, so check for it explicitly. Only trust a
         # "not visible" answer after the window has been seen, in case a backend lags.
         visible = window_visible()
@@ -245,6 +338,13 @@ def parse_args(argv=None):
     parser.add_argument("--width", type=int, default=1280, help="requested capture width")
     parser.add_argument("--height", type=int, default=720, help="requested capture height")
     parser.add_argument("--model", type=Path, help="path to a hand_landmarker.task model (default: auto-download)")
+    parser.add_argument("--gesture-model", type=Path, default=DEFAULT_CLASSIFIER_PATH,
+                        help="learned gesture classifier (default: models/gesture_classifier.json)")
+    parser.add_argument("--rules-only", action="store_true", help="start with the learned model off (m turns it on)")
+    parser.add_argument("--min-detection", type=float, default=MIN_HAND_DETECTION_CONFIDENCE,
+                        help=f"MediaPipe hand detection confidence (default {MIN_HAND_DETECTION_CONFIDENCE}; raise if phantom hands appear)")
+    parser.add_argument("--min-presence", type=float, default=MIN_HAND_PRESENCE_CONFIDENCE,
+                        help=f"MediaPipe hand presence confidence (default {MIN_HAND_PRESENCE_CONFIDENCE})")
     parser.add_argument("--max-frames", type=int, help="stop after N frames (for testing)")
     return parser.parse_args(argv)
 
@@ -254,12 +354,19 @@ def main(argv=None):
     if args.model and not args.model.is_file():
         raise RuntimeError(f"Model file not found: {args.model}")
     model_path = args.model or ensure_model()
+    gesture_model = None
+    if args.gesture_model.is_file():
+        gesture_model = GestureModel.load(args.gesture_model)
+    else:
+        print(f"No learned gesture model at {args.gesture_model}; using the rules alone.")
     cap = open_camera(args.camera, args.width, args.height)
     try:
-        with create_landmarker(model_path) as landmarker:
+        with create_landmarker(model_path, min_detection=args.min_detection, min_presence=args.min_presence) as landmarker:
             w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             print(f"Hand tracking active on camera {args.camera} at {w}x{h}. Press 'q' or Esc to exit.")
-            frames, fps = run(cap, GesturePipeline(landmarker, mirrored=True), args.max_frames)
+            pipeline = GesturePipeline(landmarker, mirrored=True, model=gesture_model)
+            pipeline.use_model = gesture_model is not None and not args.rules_only
+            frames, fps = run(cap, pipeline, args.max_frames)
             print(f"Processed {frames} frames at {fps:.1f} FPS.")
     except KeyboardInterrupt:
         pass
