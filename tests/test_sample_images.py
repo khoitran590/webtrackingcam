@@ -12,11 +12,13 @@ import numpy as np
 import pytest
 import ssl
 
+from face_expression import FaceBox, FaceReading
 from gesture_model import DEFAULT_CLASSIFIER_PATH, GestureModel
 from hand_gesture_tracker import (
     GesturePipeline,
     avoid_labels,
     create_landmarker,
+    draw_face,
     draw_hand,
     draw_hud,
     ensure_model,
@@ -136,10 +138,11 @@ def test_model_can_be_switched_off(model_path):
     assert reading.raw_gesture == reading.rule_gesture == "Peace / Victory" and reading.model_guess is None
 
 
+@pytest.mark.parametrize("faces", [None, True, False])
 @pytest.mark.parametrize("mode", [None, True, False])
-def test_hud_draws_in_every_mode(mode):
+def test_hud_draws_in_every_mode(mode, faces):
     frame = np.zeros((720, 1280, 3), np.uint8)
-    draw_hud(frame, 30.0, "Heart", mode)
+    draw_hud(frame, 30.0, "Heart", mode, faces)
     assert frame.any()
 
 
@@ -239,6 +242,47 @@ def test_m_key_toggles_the_model(model_path, headless):
     keys.extend([ord("m"), ord("q")])
     app.run(FakeCapture([]), no_model, max_frames=100)
     assert no_model.use_model is False  # without a model, m does nothing
+
+
+class StubFaces:
+    """Stands in for FacePipeline: one smiling face; counts the frames it was asked to read."""
+
+    def __init__(self, expression="Happy"):
+        self.enabled, self.calls, self.expression = True, 0, expression
+
+    def process(self, frame, t):
+        self.calls += 1
+        p = np.eye(7)[3]
+        return [FaceReading(0, self.expression, 0.9, p, p, FaceBox((640.0, 300.0), 200.0, 0.2))]
+
+
+def test_f_key_toggles_faces_and_skips_them_while_off(headless):
+    app, keys = headless
+    faces = StubFaces()
+    keys.extend([-1, ord("f"), -1, -1, ord("f"), -1, ord("q")])
+    frames, _ = app.run(FakeCapture([]), NoHands(), max_frames=100, faces=faces)
+    assert frames == 7 and faces.enabled
+    assert faces.calls == 4  # frames 3-5 ran with faces off
+    keys.extend([ord("f"), ord("q")])
+    app.run(FakeCapture([]), NoHands(), max_frames=100)  # without faces, f does nothing
+
+
+def test_face_label_moves_clear_of_a_hand_label():
+    frame = np.zeros((720, 1280, 3), np.uint8)
+    [face] = StubFaces().process(frame, 0.0)
+    alone = []
+    draw_face(frame, face, alone)
+    placed = list(alone)  # a hand label already where the face label would go
+    draw_face(frame, face, placed)
+    assert len(placed) == 2 and not boxes_overlap(*placed)
+
+
+def test_unsure_face_gets_a_box_but_no_label():
+    frame = np.zeros((720, 1280, 3), np.uint8)
+    [face] = StubFaces(expression=None).process(frame, 0.0)
+    placed = []
+    draw_face(frame, face, placed)
+    assert frame.any() and placed == []
 
 
 class NoHands:

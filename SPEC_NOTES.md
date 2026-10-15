@@ -52,7 +52,7 @@ Every photo gives the same result when mirrored, as the live app does.
 | C6 | On macOS, a missing camera permission shows up as a bare "Could not access the webcam". | **Resolved**: the error explains where to grant access. Confirmed on this machine, where the terminal has no permission yet. |
 | C7 | Camera index 0 is hard-coded. | **Resolved**: `--camera N`. |
 | C8 | Tasks `VIDEO` mode needs strictly increasing timestamps. | **Resolved** |
-| C9 | No tests. | **Resolved**: 171 tests (`pytest`), plus `tools/evaluate_hagrid.py`, which measures accuracy on real photos (sections D and E). |
+| C9 | No tests. | **Resolved**: 208 tests (`pytest`), plus `tools/evaluate_hagrid.py` and `tools/evaluate_faces.py`, which measure accuracy on real photos (sections D, E and F). |
 
 ## D. Gestures added after the spec, and accuracy on real photos
 
@@ -131,6 +131,54 @@ direction, thumb in/out (Rock On vs. ILY), finger counts and all two-hand gestur
 | E4 | **HaGRID's idle hands are far away and hanging at people's sides.** Every model trained on them called close-up, spread open palms (the sample photos) "no gesture", the larger networks with up to 99% confidence. Mirroring training hands to simulate the back of the hand, adding the hand angle, and a finger-spread rule did not fix it. | **Open**: the "no gesture" gate needs ≥80% confidence (the 64-unit model peaks at 77% on those palms; larger models were picked against for this). Recalibrate with your own takes (`tools/record_samples.py`). |
 | E5 | **The live app used stricter MediaPipe settings than every measurement**: detection 0.7 vs. 0.5. At 0.7, 89.6% of held-out gesture photos had a hand found instead of 94.2%, and two-hand gestures dropped from 76% to 64%. | **Resolved**: detection and presence 0.3 for both the app and the evaluator. That finds a hand in 96.0%, both hands of a two-hand gesture in 86% (was 67%). About 0.3% of photos gain a phantom "hand"; at 0.2, faces and kettles were detected too. `--min-detection` adjusts it live. |
 
+## F. Facial expressions
+
+Not in the spec. `face_expression.py` finds faces with MediaPipe's face landmarker, turns each face so its eyes
+are level, crops it, and classifies it with [HSEmotion](https://github.com/sb-ai-lab/EmotiEffLib)'s
+EfficientNet-B0 (`enet_b0_8_best_afew`, trained on AffectNet, Apache-2.0) through OpenCV's DNN module. This adds
+no new dependency. Probabilities are averaged over time per face (0.3 s time constant), and a face gets no label
+while no expression is at least 50% likely. The labels name the expression a face shows, not what the person feels.
+
+**Choice of engine.** Mean per-expression accuracy (chance 14–17%), before any of the changes below:
+
+| Engine | AffectNet (2.7k photos, 7 expressions) | RAF-DB (10.6k photos; this copy had no Neutral, so 6 expressions) | Time per face |
+|---|---|---|---|
+| FER+ (ONNX model zoo) | 41% | 35% | 7 ms |
+| MediaPipe's 52 face blendshapes + logistic regression | 46% | 55% (trained and tested on RAF-DB itself) | ~0 ms |
+| **HSEmotion EfficientNet-B0** | 66% (may include its training photos) | **61%** | 9 ms |
+| HSEmotion EfficientNet-B2 | 68% | 63% | 16 ms |
+
+**Accuracy.** [RAF-DB](http://www.whdeng.cn/RAF/model1.html)'s official split, which the network never saw:
+**train** (12,271 photos) was used to choose the crop, the cut-off and the offsets (F3), and **test** (3,068)
+was not used for anything. AffectNet (5,235 photos, contempt excluded) is a re-split of unknown origin that may
+contain the network's own training photos, and half of it was used to fit the offsets (F4). All numbers count faces MediaPipe found (89% of RAF-DB's 100 px
+photos and 99.7% of AffectNet's). Run `tools/evaluate_faces.py` to reproduce them.
+
+| Expression | RAF-DB train | RAF-DB test | AffectNet |
+|---|---|---|---|
+| Happy | 87% | 86% | 87% |
+| Sad | 83% | 85% | 61% |
+| Neutral | 77% | 78% | 48% |
+| Angry | 71% | 79% | 56% |
+| Fearful | 69% | 66% | 60% |
+| Surprised | 53% | 53% | 81% |
+| Disgusted | 47% | 47% | 73% |
+| **Mean** | **69.5%** | **70.6%** | **66.6%** |
+
+At the 50% cut-off, 81% of RAF-DB test faces get a label and 85% of those labels are right (78% with no cut-off).
+The share of faces shown, and how often the shown label is right, at each cut-off is printed by the evaluator.
+
+| # | Finding | Status |
+|---|---------|--------|
+| F1 | **A tilted head defeats the network**, which was trained on upright faces. On RAF-DB train photos turned 45° (300 per expression, before F3), accuracy fell from 67% to 42%; MediaPipe's own 90°-turned test portrait drops from Happy at 100% to 52%. | **Resolved**: the crop is turned so the eyes are level: 67% upright, 67% at 20° and at 45°, and no change on upright faces (67.1% vs. 67.3% without). Unit-tested at six angles, plus the real 90° portrait. |
+| F2 | The network has an 8th class, **contempt**: AffectNet's least reliable class, and RAF-DB has no contempt photos to measure it. | **Resolved**: dropped, and the other seven renormalised. |
+| F3 | **The network calls a resting face Angry** about one time in five (RAF-DB 20%, AffectNet 15%), and on RAF-DB it calls Surprised faces Fearful (46%) and Disgusted faces Angry (51%). | **Improved**: per-expression offsets added to the network's scores (`CLASS_OFFSETS`): RAF-DB test 65.7% → 70.6% (+4.9 points, 95% bootstrap interval +3.2 to +6.7), resting faces read as Angry 20% → 8% (AffectNet 15% → 5%), Surprised 32% → 53%. Costs: Angry recall 88% → 79% (AffectNet 72% → 57%), Fearful 74% → 66% (75% → 58%). |
+| F4 | **RAF-DB and AffectNet disagree on Surprised vs. Fearful.** Offsets fitted to RAF-DB alone reached 71.9% on its test split but dropped AffectNet from 66% to 58% (Fearful 75% → 35%). | **Resolved**: offsets are fitted on RAF-DB train and half of AffectNet together (`tools/fit_expression_offsets.py`); the unseen AffectNet half stays level (65.9% → 65.7%). |
+| F5 | With the offsets, **AffectNet's resting faces read as Surprised 21%** of the time (16% before), so on that dataset part of the false Angry moved to Surprised. | **Open**: check with live takes. |
+| F6 | **Disgusted is the weakest expression** (47% on RAF-DB; mostly read as Angry) and Surprised is still read as Fearful 27% of the time on RAF-DB. | **Open** |
+| F7 | The crop margin matters: crops 1.0× the landmarks' extent scored best of 0.8–1.4 (67.1% vs. 66.0% at 1.1 and 61.6% at 1.4, on about 1,780 train faces, before F3). | **Resolved**: 1.0. |
+| F8 | Speed: the face landmarker and network add about 12 ms per frame for one face (6.5 → 18.8 ms per 720p frame on an Apple M5, drawing included). | **Resolved**: one face by default (`--max-faces`); `f` or `--no-faces` turns faces off. |
+
 ## Not verified
 
 - **A live webcam run.** This terminal has no camera permission, so the loop and the sample recorder were tested with a fake camera that replays photos.
@@ -139,4 +187,7 @@ direction, thumb in/out (Rock On vs. ILY), finger counts and all two-hand gestur
 - **All gestures, the learned model and the "no gesture" gate on a live webcam.** Sections D and E come from still photos of distant hands.
 - **Phantom hands in video.** At the lower detection settings (E5), a phantom detection could persist through tracking; photos cannot show this.
 - **Smoothing settings.** The One-Euro values (`min_cutoff=1.0, beta=10`) were set by reasoning about units, not tuned on live video.
+- **Facial expressions on a live webcam.** Section F comes from still photos of other people. The 0.3 s smoothing,
+  the offsets (F3) and the 50% cut-off have not been checked on video, nor have glasses, side lighting or a face
+  turned away from the camera.
 - **Spec §6 Phases 2–3:** the ML classifier for static gestures is implemented (section E); dynamic gestures, mouse control and the WebSocket bus are not.

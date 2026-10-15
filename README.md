@@ -1,7 +1,7 @@
-# Hand Gesture Tracker
+# Hand Gesture and Face Expression Tracker
 
-Real-time webcam hand tracking and static gesture recognition with MediaPipe Tasks and OpenCV.
-It tracks up to two hands and works at any hand rotation.
+Real-time webcam hand tracking, static gesture recognition and facial expression recognition with
+MediaPipe Tasks and OpenCV. It tracks up to two hands and works at any hand rotation and head tilt.
 
 - **One hand:** Fist, Open Palm, Thumbs Up, Thumbs Down, Thumb Out, Pointing, Peace / Victory,
   Rock On, Spider-Man / ILY, OK Sign, Call Me, L Shape. Anything else is labeled by finger count
@@ -11,8 +11,12 @@ It tracks up to two hands and works at any hand rotation.
 - **Rules + a small learned model.** The rules handle rotation, thumb direction and two-hand gestures; the
   model (trained on HaGRID photos) is more accurate on hard shapes and recognises a hand that is *not* making
   a gesture, whose label is then hidden. Press `m` to compare with the rules alone.
+- **Facial expressions:** Neutral, Happy, Sad, Surprised, Angry, Disgusted, Fearful, shown next to a box
+  around the face. A face gets no label while no expression is at least 50% likely. The labels name what a
+  face *shows*, not what someone feels. Press `f` to switch them off.
 
-Accuracy on real photos is in [SPEC_NOTES.md](SPEC_NOTES.md#d-gestures-added-after-the-spec-and-accuracy-on-real-photos).
+Accuracy on real photos is in [SPEC_NOTES.md](SPEC_NOTES.md#d-gestures-added-after-the-spec-and-accuracy-on-real-photos)
+(hands) and [section F](SPEC_NOTES.md#f-facial-expressions) (faces).
 
 This implements `hand_gesture_tracking_specification.md`. See [SPEC_NOTES.md](SPEC_NOTES.md) for
 where that spec falls short and how each gap is handled here.
@@ -32,11 +36,16 @@ Don't install `opencv-python` separately. `mediapipe` already installs `opencv-c
 .venv/bin/python hand_gesture_tracker.py            # --camera 1 to pick another camera
 ```
 
-Keys: `m` switches the learned model on/off, `q` or `Esc` quits (as does closing the window).
-Options: `--rules-only` starts with the model off; `--min-detection 0.5` makes hand detection stricter if
-phantom hands appear (default 0.3).
+Keys: `m` switches the learned gesture model on/off, `f` switches facial expressions on/off, `q` or `Esc`
+quits (as does closing the window).
+Options: `--rules-only` starts with the gesture model off; `--min-detection 0.5` makes hand detection stricter if
+phantom hands appear (default 0.3); `--no-faces` skips facial expressions entirely (the face models are not
+loaded); `--max-faces 2` reads more than one face (each adds about 12 ms per frame);
+`--min-expression-confidence 0.7` shows fewer but more reliable expressions (default 0.5).
 
-The hand model (~7.8 MB) is downloaded to `models/` on first run and checked against a pinned SHA-256.
+Three models are downloaded to `models/` on first run and checked against pinned SHA-256 sums: the hand model
+(~7.8 MB), the face landmark model (~3.8 MB) and the expression network (~16 MB,
+[HSEmotion](https://github.com/sb-ai-lab/EmotiEffLib) EfficientNet-B0, Apache-2.0).
 The gesture model (`models/gesture_classifier.json`, 155 KB) is part of the repository.
 
 **macOS:** allow camera access for your terminal app in System Settings → Privacy & Security → Camera,
@@ -47,8 +56,11 @@ then restart the terminal.
 - `gesture_logic.py`: finger states, one- and two-hand gesture classification, label voting,
   smoothing and hand tracking. It has no camera or MediaPipe dependency.
 - `gesture_model.py`: the learned classifier (numpy only) and how its answer is combined with the rules.
-- `hand_gesture_tracker.py`: model download, the MediaPipe pipeline, drawing, and the camera loop.
-- `tools/evaluate_hagrid.py`: measures accuracy on real photos (see below).
+- `face_expression.py`: the face crop (turned so the eyes are level), the expression network, smoothing
+  over time, and the face pipeline.
+- `hand_gesture_tracker.py`: model downloads, the hand pipeline, drawing, and the camera loop.
+- `tools/evaluate_hagrid.py`, `tools/evaluate_faces.py`: measure accuracy on real photos (see below).
+- `tools/fit_expression_offsets.py`: refits the expression network's per-class offsets.
 - `tools/train_gesture_model.py`, `tools/record_samples.py`: retrain the model, optionally on your own hands.
 - `tools/hagrid_data.py`: reads HaGRID photos from Hugging Face.
 
@@ -58,7 +70,7 @@ then restart the terminal.
 uv pip install -r requirements-dev.txt && .venv/bin/python -m pytest
 ```
 
-The first run downloads the model and 10 sample hand photos into `tests/.cache/`.
+The first run downloads the models, 10 sample hand photos and 2 face photos into `models/` and `tests/.cache/`.
 
 ## Accuracy on real photos
 
@@ -72,6 +84,17 @@ This downloads 50–100 photos per class from the [HaGRID v2](https://github.com
 test split (about 400 MB per run, cached in `tools/.cache/`). Each photo goes through the app's own
 pipeline, and the script prints, for the rules alone and for rules + model: per-gesture accuracy,
 how often relaxed hands and unnamed shapes get a gesture name, and two-hand false positives.
+
+Facial expressions are measured on [RAF-DB](http://www.whdeng.cn/RAF/model1.html) and AffectNet:
+
+```bash
+.venv/bin/python tools/evaluate_faces.py                      # RAF-DB train: photos the settings were chosen on
+.venv/bin/python tools/evaluate_faces.py --split test         # RAF-DB test: held-out photos
+.venv/bin/python tools/evaluate_faces.py --dataset affectnet  # may overlap the network's training photos
+```
+
+This downloads 33 MB (RAF-DB) or 108 MB (AffectNet) of face photos from unofficial copies on Hugging Face into
+`tools/.cache/faces/`. Both datasets are licensed for non-commercial research only.
 
 ## Training the model on your own hands
 

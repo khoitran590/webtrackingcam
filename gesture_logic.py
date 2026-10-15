@@ -270,11 +270,11 @@ class LandmarkSmoother:
 
 
 class HandTrack:
-    """Per-hand state that has to survive across frames."""
+    """Per-hand state that has to survive across frames. ``position`` is the wrist."""
 
-    def __init__(self, track_id, wrist, vote_size, smoothing):
+    def __init__(self, track_id, position, vote_size, smoothing):
         self.id = track_id
-        self.wrist = wrist
+        self.position = position
         self.missed = 0
         self.vote = GestureVote(vote_size)
         self.smoother = LandmarkSmoother(**smoothing)
@@ -283,7 +283,8 @@ class HandTrack:
 class HandTracker:
     """Gives each detected hand a stable identity by matching it to the nearest wrist from
     the previous frames. This is more reliable than keying on the Left/Right label, which
-    MediaPipe occasionally gives to both hands at once."""
+    MediaPipe occasionally gives to both hands at once. Subclasses can track other things
+    (faces) by overriding ``new_track``."""
 
     # Normalized-coordinate units: a hand moving fast covers ~2 frame-widths per second.
     DEFAULT_SMOOTHING = {"min_cutoff": 1.0, "beta": 10.0, "d_cutoff": 1.0}
@@ -296,13 +297,16 @@ class HandTracker:
         self.tracks = []
         self._next_id = 0
 
+    def new_track(self, track_id, position):
+        return HandTrack(track_id, position, self.vote_size, self.smoothing)
+
     def update(self, wrists):
         """Match this frame's wrist positions (normalized x, y) to tracks.
 
-        Returns one HandTrack per wrist, in the same order as ``wrists``.
+        Returns one track per wrist, in the same order as ``wrists``.
         """
         pairs = sorted(
-            ((math.dist(w, track.wrist), i, track) for i, w in enumerate(wrists) for track in self.tracks),
+            ((math.dist(w, track.position), i, track) for i, w in enumerate(wrists) for track in self.tracks),
             key=lambda p: (p[0], p[1], p[2].id),
         )
         assigned = [None] * len(wrists)
@@ -315,10 +319,10 @@ class HandTracker:
                 used.add(track.id)
         for i, w in enumerate(wrists):
             if assigned[i] is None:
-                assigned[i] = HandTrack(self._next_id, w, self.vote_size, self.smoothing)
+                assigned[i] = self.new_track(self._next_id, w)
                 self._next_id += 1
                 self.tracks.append(assigned[i])
-            assigned[i].wrist = w
+            assigned[i].position = w
             assigned[i].missed = 0
         matched = {t.id for t in assigned}
         for track in self.tracks:

@@ -1,7 +1,8 @@
-"""Real-time webcam hand tracking and gesture recognition (MediaPipe Tasks + OpenCV).
+"""Real-time webcam hand gestures and facial expressions (MediaPipe Tasks + OpenCV).
 
-Usage:  python hand_gesture_tracker.py [--camera 0] [--width 1280] [--height 720] [--rules-only]
-Keys:   m switches the learned model on/off (rules only); q or Esc quits, as does closing the window.
+Usage:  python hand_gesture_tracker.py [--camera 0] [--width 1280] [--height 720] [--rules-only] [--no-faces]
+Keys:   m switches the learned gesture model on/off (rules only); f switches facial expressions on/off;
+        q or Esc quits, as does closing the window.
 """
 
 import argparse
@@ -12,12 +13,14 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 
 import certifi
 import cv2
 import mediapipe as mp
+import numpy as np
 
 from gesture_logic import (
     WRIST,
@@ -30,13 +33,27 @@ from gesture_logic import (
     pinch_ratio,
     thumb_direction,
 )
+from face_expression import (
+    EXPRESSION_MODEL_SHA256,
+    EXPRESSION_MODEL_URL,
+    FACE_LANDMARKER_SHA256,
+    FACE_LANDMARKER_URL,
+    ExpressionModel,
+    FacePipeline,
+    create_face_landmarker,
+)
+from face_expression import (
+    MIN_CONFIDENCE as MIN_EXPRESSION_CONFIDENCE,
+)
 from gesture_model import DEFAULT_CLASSIFIER_PATH, GestureModel, combine, hand_features
 
 MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
 MODEL_SHA256 = "fbc2a30080c3c557093b5ddfc334698132eb341044ccee322ccf8bcf3607cde1"
 DEFAULT_MODEL_PATH = Path(__file__).resolve().parent / "models" / "hand_landmarker.task"
+FACE_LANDMARKER_PATH = DEFAULT_MODEL_PATH.with_name("face_landmarker.task")
+EXPRESSION_MODEL_PATH = DEFAULT_MODEL_PATH.with_name("expression_enet_b0_8.onnx")
 
-WINDOW_NAME = "MediaPipe Hand Gesture Tracker"
+WINDOW_NAME = "Hand Gesture and Face Expression Tracker"
 HAND_CONNECTIONS = [(c.start, c.end) for c in mp.tasks.vision.HandLandmarksConnections.HAND_CONNECTIONS]
 FINGERTIPS = {4, 8, 12, 16, 20}
 HUD_HEIGHT = 85  # top strip (status line + two-hand banner) kept free of hand labels
@@ -49,7 +66,7 @@ MAX_CONSECUTIVE_READ_FAILURES = 60  # ~2 s at 30 fps; cameras often drop frames 
 MIN_HAND_DETECTION_CONFIDENCE = 0.3
 MIN_HAND_PRESENCE_CONFIDENCE = 0.3
 
-GREEN, WHITE, BLACK, ORANGE, MAGENTA = (0, 255, 0), (255, 255, 255), (0, 0, 0), (0, 165, 255), (255, 0, 255)
+GREEN, WHITE, BLACK, ORANGE, MAGENTA, CYAN = (0, 255, 0), (255, 255, 255), (0, 0, 0), (0, 165, 255), (255, 0, 255), (255, 255, 0)
 
 
 def _sha256(path):
@@ -60,26 +77,32 @@ def _sha256(path):
     return h.hexdigest()
 
 
-def ensure_model(path=DEFAULT_MODEL_PATH):
-    """Download the pinned hand-landmarker model on first use and verify its checksum."""
+def ensure_model(path=DEFAULT_MODEL_PATH, url=MODEL_URL, sha256=MODEL_SHA256, name="hand landmark model"):
+    """Download a pinned model on first use and verify its checksum."""
     path = Path(path)
-    if path.exists() and _sha256(path) == MODEL_SHA256:
+    if path.exists() and _sha256(path) == sha256:
         return path
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".part")
-    print(f"Downloading hand landmark model to {path} ...")
+    print(f"Downloading {name} to {path} ...")
     try:
         context = ssl.create_default_context(cafile=certifi.where())
-        with urllib.request.urlopen(MODEL_URL, context=context, timeout=60) as resp, open(tmp, "wb") as f:
+        with urllib.request.urlopen(url, context=context, timeout=60) as resp, open(tmp, "wb") as f:
             shutil.copyfileobj(resp, f)
     except (urllib.error.URLError, OSError) as e:
         tmp.unlink(missing_ok=True)
-        raise RuntimeError(f"Could not download the model ({e}). Download it manually from\n  {MODEL_URL}\nto\n  {path}") from e
-    if _sha256(tmp) != MODEL_SHA256:
+        raise RuntimeError(f"Could not download the {name} ({e}). Download it manually from\n  {url}\nto\n  {path}") from e
+    if _sha256(tmp) != sha256:
         tmp.unlink()
-        raise RuntimeError("Downloaded model failed its SHA-256 check; refusing to use it.")
+        raise RuntimeError(f"Downloaded {name} failed its SHA-256 check; refusing to use it.")
     tmp.replace(path)
     return path
+
+
+def ensure_face_models():
+    """(face landmarker, expression network) paths, downloaded on first use."""
+    return (ensure_model(FACE_LANDMARKER_PATH, FACE_LANDMARKER_URL, FACE_LANDMARKER_SHA256, "face landmark model"),
+            ensure_model(EXPRESSION_MODEL_PATH, EXPRESSION_MODEL_URL, EXPRESSION_MODEL_SHA256, "expression model"))
 
 
 def create_landmarker(model_path, num_hands=2, min_detection=MIN_HAND_DETECTION_CONFIDENCE,
@@ -218,6 +241,23 @@ def draw_hand(frame, reading, placed=None):
     draw_text(frame, text, origin)
 
 
+def draw_face(frame, reading, placed=None):
+    """Outline the square the expression network saw (turned with the face) and label it with
+    the expression, unless no expression is likely enough. Shares ``placed`` with draw_hand."""
+    h, w = frame.shape[:2]
+    corners = [(int(round(x)), int(round(y))) for x, y in reading.box.corners()]
+    cv2.polylines(frame, [np.array(corners, np.int32)], True, CYAN, 2, cv2.LINE_AA)
+    if not reading.expression:
+        return
+    text = f"{reading.expression} {reading.confidence:.0%}"
+    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+    origin = label_origin(corners, (tw, th), (w, h), top=HUD_HEIGHT)
+    if placed is not None:
+        origin = avoid_labels(origin, (tw, th), (w, h), placed, top=HUD_HEIGHT)
+        placed.append(label_box(origin, (tw, th)))
+    draw_text(frame, text, origin, CYAN)
+
+
 def label_origin(pts, text_size, frame_size, margin=10, gap=15, top=10):
     """Bottom-left text origin: above the hand, or below it when there is no room, and
     always fully on screen (the spec drew it at wrist_y + 30, usually below the frame).
@@ -256,11 +296,14 @@ def avoid_labels(origin, text_size, frame_size, placed, margin=10, top=10):
     return origin
 
 
-def draw_hud(frame, fps, two_hand_gesture=None, mode=None):
-    """``mode``: None when there is no learned model, else whether it is in use."""
+def draw_hud(frame, fps, two_hand_gesture=None, mode=None, faces=None):
+    """``mode``: None when there is no learned model, else whether it is in use.
+    ``faces``: None when expressions are not loaded, else whether they are on."""
     status = f"{fps:4.1f} FPS   q / Esc: quit"
     if mode is not None:
         status += f"   m: model {'ON (rules + model)' if mode else 'OFF (rules only)'}"
+    if faces is not None:
+        status += f"   f: faces {'ON' if faces else 'OFF'}"
     draw_text(frame, status, (10, 30), WHITE, 0.6)
     if two_hand_gesture:
         text = f"Both hands: {two_hand_gesture}"
@@ -290,7 +333,8 @@ def window_visible():
         return False
 
 
-def run(cap, pipeline, max_frames=None):
+def run(cap, pipeline, max_frames=None, faces=None):
+    """``faces``: an optional FacePipeline; its ``enabled`` flag is what the f key switches."""
     frames, read_failures, fps, window_seen = 0, 0, 0.0, False
     start = last = time.monotonic()
     while max_frames is None or frames < max_frames:
@@ -306,14 +350,18 @@ def run(cap, pipeline, max_frames=None):
         frame = cv2.flip(frame, 1)  # mirror view; GesturePipeline(mirrored=True) corrects the labels
         now = time.monotonic()
         result = pipeline.process(frame, now)
+        face_readings = faces.process(frame, now) if faces is not None and faces.enabled else []
         placed = []
         for reading in result.hands:
             draw_hand(frame, reading, placed)
+        for reading in face_readings:
+            draw_face(frame, reading, placed)
         if frames:
             instant = 1.0 / max(now - last, 1e-6)
             fps = instant if fps == 0 else 0.9 * fps + 0.1 * instant
         last = now
-        draw_hud(frame, fps, result.two_hand_gesture, pipeline.use_model if pipeline.model else None)
+        draw_hud(frame, fps, result.two_hand_gesture, pipeline.use_model if pipeline.model else None,
+                 faces.enabled if faces is not None else None)
 
         cv2.imshow(WINDOW_NAME, frame)
         frames += 1
@@ -322,6 +370,8 @@ def run(cap, pipeline, max_frames=None):
             break
         if key == ord("m") and pipeline.model is not None:
             pipeline.use_model = not pipeline.use_model
+        if key == ord("f") and faces is not None:
+            faces.enabled = not faces.enabled
         # Closing the window does not send a key, so check for it explicitly. Only trust a
         # "not visible" answer after the window has been seen, in case a backend lags.
         visible = window_visible()
@@ -345,6 +395,10 @@ def parse_args(argv=None):
                         help=f"MediaPipe hand detection confidence (default {MIN_HAND_DETECTION_CONFIDENCE}; raise if phantom hands appear)")
     parser.add_argument("--min-presence", type=float, default=MIN_HAND_PRESENCE_CONFIDENCE,
                         help=f"MediaPipe hand presence confidence (default {MIN_HAND_PRESENCE_CONFIDENCE})")
+    parser.add_argument("--no-faces", action="store_true", help="no facial expressions (the face models are not loaded)")
+    parser.add_argument("--max-faces", type=int, default=1, help="faces to read expressions from (default 1)")
+    parser.add_argument("--min-expression-confidence", type=float, default=MIN_EXPRESSION_CONFIDENCE,
+                        help=f"show an expression only when at least this likely (default {MIN_EXPRESSION_CONFIDENCE})")
     parser.add_argument("--max-frames", type=int, help="stop after N frames (for testing)")
     return parser.parse_args(argv)
 
@@ -359,14 +413,22 @@ def main(argv=None):
         gesture_model = GestureModel.load(args.gesture_model)
     else:
         print(f"No learned gesture model at {args.gesture_model}; using the rules alone.")
+    face_paths = None if args.no_faces else ensure_face_models()
     cap = open_camera(args.camera, args.width, args.height)
     try:
-        with create_landmarker(model_path, min_detection=args.min_detection, min_presence=args.min_presence) as landmarker:
+        with ExitStack() as stack:
+            landmarker = stack.enter_context(
+                create_landmarker(model_path, min_detection=args.min_detection, min_presence=args.min_presence))
+            faces = None
+            if face_paths:
+                face_landmarker = stack.enter_context(create_face_landmarker(face_paths[0], num_faces=args.max_faces))
+                faces = FacePipeline(face_landmarker, ExpressionModel(face_paths[1]),
+                                     min_confidence=args.min_expression_confidence)
             w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            print(f"Hand tracking active on camera {args.camera} at {w}x{h}. Press 'q' or Esc to exit.")
+            print(f"Tracking active on camera {args.camera} at {w}x{h}. Press 'q' or Esc to exit.")
             pipeline = GesturePipeline(landmarker, mirrored=True, model=gesture_model)
             pipeline.use_model = gesture_model is not None and not args.rules_only
-            frames, fps = run(cap, pipeline, args.max_frames)
+            frames, fps = run(cap, pipeline, args.max_frames, faces)
             print(f"Processed {frames} frames at {fps:.1f} FPS.")
     except KeyboardInterrupt:
         pass
