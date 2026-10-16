@@ -200,6 +200,49 @@ def test_tracker_keeps_ids_and_expires_lost_hands():
     assert [t.id for t in tracker.update([(0.22, 0.49), (0.79, 0.5)])] == [0, 2]
 
 
+def test_tracker_confirms_a_hand_only_after_frames_in_a_row():
+    tracker = HandTracker(confirm_frames=3)
+    seen = [tracker.confirmed(t) for _ in range(3) for t in tracker.update([(0.2, 0.5)])]
+    assert seen == [False, False, True]
+    tracker.update([])  # a confirmed hand survives a missed frame
+    assert [tracker.confirmed(t) for t in tracker.update([(0.2, 0.5)])] == [True]
+    # A phantom that flickers in and out is dropped on every miss, so it is never confirmed.
+    for _ in range(10):
+        _, phantom = tracker.update([(0.2, 0.5), (0.8, 0.5)])
+        assert not tracker.confirmed(phantom)
+        tracker.update([(0.2, 0.5)])
+
+
+def crossing(frames=9, speed=0.05):
+    """Two hands moving towards each other, one slightly higher, and past each other; the hand
+    in front hides the other at the crossing (frame 4). Yields (wrists, labels, true names)."""
+    for f in range(frames):
+        a, b = (0.3 + speed * f, 0.5), (0.7 - speed * f, 0.52)
+        hands = [("a", a, "Right"), ("b", b, "Left")] if f != 4 else [("a", a, "Right")]
+        yield [w for _, w, _ in hands], [l for _, _, l in hands], [n for n, _, _ in hands]
+
+
+@pytest.mark.parametrize("use_labels", [True, False])
+def test_tracker_keeps_identities_when_hands_cross(use_labels):
+    """Nearest-wrist matching swapped them: right after the crossing each hand is nearest to
+    where the other one was. Predicting from velocity, or the Left/Right labels, keeps them."""
+    tracker, ids = HandTracker(), {}
+    for wrists, labels, names in crossing():
+        for name, track in zip(names, tracker.update(wrists, labels if use_labels else None)):
+            assert ids.setdefault(name, track.id) == track.id
+
+
+def test_tracker_label_does_not_override_a_clear_distance():
+    """MediaPipe sometimes mislabels a hand; a wrong label must not pull it onto another track."""
+    tracker = HandTracker()
+    for _ in range(5):
+        a, b = tracker.update([(0.3, 0.5), (0.7, 0.5)], ["Right", "Left"])
+    a2, b2 = tracker.update([(0.3, 0.5), (0.7, 0.5)], ["Left", "Left"])
+    assert (a2.id, b2.id) == (a.id, b.id)
+    (only,) = tracker.update([(0.65, 0.5)], ["Right"])  # one hand hidden, the other mislabelled
+    assert only.id == b.id
+
+
 def test_tracker_equidistant_tracks_do_not_crash():
     tracker = HandTracker()
     tracker.update([(0.4, 0.5), (0.6, 0.5)])

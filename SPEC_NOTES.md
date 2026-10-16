@@ -52,7 +52,7 @@ Every photo gives the same result when mirrored, as the live app does.
 | C6 | On macOS, a missing camera permission shows up as a bare "Could not access the webcam". | **Resolved**: the error explains where to grant access. Confirmed on this machine, where the terminal has no permission yet. |
 | C7 | Camera index 0 is hard-coded. | **Resolved**: `--camera N`. |
 | C8 | Tasks `VIDEO` mode needs strictly increasing timestamps. | **Resolved** |
-| C9 | No tests. | **Resolved**: 208 tests (`pytest`), plus `tools/evaluate_hagrid.py` and `tools/evaluate_faces.py`, which measure accuracy on real photos (sections D, E and F). |
+| C9 | No tests. | **Resolved**: 217 tests (`pytest`), plus `tools/evaluate_hagrid.py` and `tools/evaluate_faces.py`, which measure accuracy on real photos (sections D, E, F and G). |
 
 ## D. Gestures added after the spec, and accuracy on real photos
 
@@ -179,13 +179,48 @@ The share of faces shown, and how often the shown label is right, at each cut-of
 | F7 | The crop margin matters: crops 1.0× the landmarks' extent scored best of 0.8–1.4 (67.1% vs. 66.0% at 1.1 and 61.6% at 1.4, on about 1,780 train faces, before F3). | **Resolved**: 1.0. |
 | F8 | Speed: the face landmarker and network add about 12 ms per frame for one face (6.5 → 18.8 ms per 720p frame on an Apple M5, drawing included). | **Resolved**: one face by default (`--max-faces`); `f` or `--no-faces` turns faces off. |
 
+## G. Hands and faces together
+
+The hand and face pipelines used to run independently. Each frame now goes faces → hands → expressions:
+the face boxes are used to drop phantom hands, and the confirmed hands are used to tell which faces they cover.
+Measured with the app's own functions on the HaGRID calibration photos of 10 classes (mute, no_gesture, call, holy,
+hand_heart, peace, one, palm, like, ok: 1,260 hands, 677 faces), on AffectNet (5,235 photos) and on RAF-DB test (3,068).
+
+| # | Finding | Status |
+|---|---------|--------|
+| G1 | **Faces produce phantom hands.** At the app's 0.3 detection setting (E5), 8–13% of close-up face photos get a "hand": squashed sets of landmarks on an eyebrow, lip, nostril or hairline. Their handedness scores are as high as real hands' (median 0.8–0.93), so the score can't filter them. | **Resolved**: a hand mostly (≥50% of landmarks) inside a face box with a palm shorter than 0.3 face sides is dropped (`face_phantom`). Phantoms measured 0.02–0.3; real hands held in front of a face in HaGRID measured 0.35–0.71. This drops 56% of hand detections on AffectNet and 89% on RAF-DB, and **0 of 1,260** HaGRID hands, including hands over the mouth and Prayer. Some dropped AffectNet detections are real hands whose landmarks had collapsed, which were unusable anyway. |
+| G2 | **Phantoms could stay on screen** (Not verified, below). | **Improved**: a new hand is shown only after 3 frames in a row (`HAND_CONFIRM_FRAMES`, about 0.1 s), and an unconfirmed track is dropped the first frame it is missed, so a detection that flickers in and out never appears. Confirmed hands still survive 10 missed frames. Still photos and the evaluators use 1. |
+| G3 | **A hand over the face.** The face landmarker still places landmarks behind a hand, and the network classifies the crop through it. On HaGRID faces a confirmed hand covers, the network gave Sad / Surprised / Fearful / Angry 15% of the time vs. 8% on clear faces, and no label 52% vs. 24%. On AffectNet, covered faces scored 65.2% vs. 66.6% (46 faces; AffectNet's own photos often show a hand over the mouth in Surprised and Fearful, so the network may use the hand as a cue). | **Resolved**: a face is *covered* when a hand's outline (widened by 0.15 palm lengths) is over at least half of an eye's or the mouth's landmarks (`covered_regions`). A covered face shows "Face covered" and keeps its last smoothed expression, unshown, until the hand moves away. It fires on 57 of 59 finger-on-lips (mute) faces, 42 of 70 no_gesture faces (in this shard mostly hands over the mouth), and 0–4 per gesture class elsewhere (Prayer and Heart held in front of the face). The outline includes the gap between thumb and fingers, so the region list can name an eye the thumb only passes. |
+
+## H. Keeping hands apart when they cross
+
+There is no video with ground truth, so tracking is measured by simulation: two real HaGRID hands (random pairs from
+the training landmarks) move past each other at 0.5, 1 and 2 frame-widths per second, 30 fps, with 0.004 landmark
+jitter, 5% of detections dropped, the front hand hiding the other half the time while they overlap, and 5% of
+Left/Right labels flipped. 102 runs per cell (3 vertical gaps × 34 seeds); a switch is a shown (confirmed) hand
+changing identity.
+
+| Shown-identity switches per 102 runs (slow / medium / fast) | Crossing | Meet and part | Side by side |
+|---|---|---|---|
+| Nearest-wrist matching (before) | 66 / 66 / 72 | 0 / 0 / 0 | 0 / 0 / 14 |
+| + velocity prediction and best joint matching | 46 / 66 / 52 | 0 / 2 / 56 | 6 / 6 / 6 |
+| **+ Left/Right label penalty 0.03 (the app)** | **8 / 6 / 10** | 0 / 0 / 2 | 6 / 6 / 6 |
+| Same, penalty 0.05 | 20 / 12 / 12 | 2 / 0 / 2 | 16 / 11 / 8 |
+
+| # | Finding | Status |
+|---|---------|--------|
+| H1 | **Crossing hands swapped identities** (and with them their gesture votes and smoothing) in about two of three crossings: right after they pass, each hand is nearest to where the other one was. | **Resolved**: `HandTracker` predicts each wrist from its smoothed per-frame velocity (up to 3 missed frames ahead), picks the matching with the lowest total cost, and adds 0.03 for a label that disagrees with the track's usual one. The penalty was chosen from 0.01-0.05 on the runs above and checked on other hands and seeds: with perfect labels 0 crossing swaps (was 60-78), and with 15% of labels flipped 46 / 4 / 10. Unit tests cover a crossing with and without labels and a mislabelled hand. |
+| H2 | Velocity prediction alone makes hands that meet and part swap (56 of 102 at 2 widths/s), because it predicts they carry on through each other. The label penalty undoes this. | **Open, small**: with 15% of labels flipped, fast meet-and-part (like a clap) swapped 28 of 102 times on the check runs (nearest-wrist: 0). Live label noise is unmeasured. |
+| H3 | When MediaPipe gives both hands the same label, the penalty applies equally to both ways of pairing them, so it cancels out; only labels that disagree with each other steer the matching. | By design. |
+
 ## Not verified
 
 - **A live webcam run.** This terminal has no camera permission, so the loop and the sample recorder were tested with a fake camera that replays photos.
 - **Live Left/Right labels.** Handedness is verified on photos, raw and mirrored, but not on a live mirrored webcam feed.
 - **Spider-Man / ILY on real hands.** The other gestures are measured on real photos (section D), but there is no ILY photo set with ground truth.
 - **All gestures, the learned model and the "no gesture" gate on a live webcam.** Sections D and E come from still photos of distant hands.
-- **Phantom hands in video.** At the lower detection settings (E5), a phantom detection could persist through tracking; photos cannot show this.
+- **Phantom hands in video.** At the lower detection settings (E5), a phantom detection could persist through tracking. Phantoms on faces are dropped (G1) and flickering ones are never shown (G2), but a phantom detected steadily for 3 frames away from any face would still be shown.
+- **Hand identities through crossings on live video** (H1). The simulation's label-flip rate is an assumption.
 - **Smoothing settings.** The One-Euro values (`min_cutoff=1.0, beta=10`) were set by reasoning about units, not tuned on live video.
 - **Facial expressions on a live webcam.** Section F comes from still photos of other people. The 0.3 s smoothing,
   the offsets (F3) and the 50% cut-off have not been checked on video, nor have glasses, side lighting or a face

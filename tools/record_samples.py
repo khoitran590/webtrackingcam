@@ -28,6 +28,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from gesture_model import DEFAULT_CLASSIFIER_PATH, GestureModel  # noqa: E402
 from hand_gesture_tracker import (  # noqa: E402
+    HAND_CONFIRM_FRAMES,
     MAGENTA,
     MAX_CONSECUTIVE_READ_FAILURES,
     WHITE,
@@ -159,7 +160,7 @@ def main(argv=None):
     cap = open_camera(args.camera, args.width, args.height)
     try:
         with create_landmarker(ensure_model()) as landmarker:
-            record(cap, GesturePipeline(landmarker, mirrored=True, model=model), Recorder(args.out))
+            record(cap, GesturePipeline(landmarker, mirrored=True, model=model, confirm_frames=HAND_CONFIRM_FRAMES), Recorder(args.out))
     except KeyboardInterrupt:
         pass
     finally:

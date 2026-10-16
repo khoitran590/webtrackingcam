@@ -16,6 +16,7 @@ CLASS_OFFSETS shift its scores to correct that; see tools/fit_expression_offsets
 """
 
 import math
+from collections import deque
 from dataclasses import dataclass
 
 import cv2
@@ -53,6 +54,23 @@ MIN_CONFIDENCE = 0.5  # smoothed probability an expression needs before it is sh
 SMOOTHING_SECONDS = 0.3  # time constant of the moving average over a face's probabilities
 
 
+def _region(connections):
+    return tuple(sorted({i for c in connections for i in (c.start, c.end)}))
+
+
+_MESH = mp.tasks.vision.FaceLandmarksConnections
+# The parts of the face an expression is read from. A hand over most of one of them (a hand over
+# the mouth, a palm over an eye) leaves the network guessing, so the face is reported as covered.
+FACE_REGIONS = {"right eye": _region(_MESH.FACE_LANDMARKS_RIGHT_EYE), "left eye": _region(_MESH.FACE_LANDMARKS_LEFT_EYE),
+                "mouth": _region(_MESH.FACE_LANDMARKS_LIPS)}
+COVERED_SHARE = 0.5  # share of a region's landmarks under a hand that makes it covered
+HAND_PAD = 0.15  # the hand's outline is widened by this many palm lengths: landmarks run down the finger middles
+# A "hand" found mostly inside a face, with a palm shorter than this many face sides, is a phantom:
+# on close-up face photos the hand model finds squashed hands on eyebrows, lips and noses (palms 0.02-0.3
+# face sides), while real hands held in front of a face in HaGRID photos measured 0.35-0.71.
+PHANTOM_MAX_PALM = 0.3
+
+
 @dataclass
 class FaceBox:
     """The square of the image the network sees: centre (x, y) in pixels, side in pixels,
@@ -71,6 +89,11 @@ class FaceBox:
         h = self.side / 2
         square = np.array([(-h, -h), (h, -h), (h, h), (-h, h)])
         return square @ self._turn() + self.centre
+
+    def share_inside(self, points_px):
+        """Share of ``points_px`` (x, y) that fall inside the box."""
+        Q = (np.asarray(points_px, dtype=float)[:, :2] - self.centre) @ self._turn().T
+        return float(np.mean(np.all(np.abs(Q) <= self.side / 2, axis=1)))
 
     def affine(self, size=INPUT_SIZE):
         """2x3 matrix taking image pixels to a size x size crop with the face upright."""
@@ -94,6 +117,31 @@ def face_box(points_px, margin=CROP_MARGIN, level=True):
     lo, hi = Q.min(0), Q.max(0)
     centre = (lo + hi) / 2 @ box._turn()
     return FaceBox(tuple(centre), float((hi - lo).max() * margin), angle)
+
+
+def face_phantom(hand_px, boxes, max_palm=PHANTOM_MAX_PALM):
+    """Whether a detected hand (21 (x, y) image points) is a phantom on a face: mostly inside
+    one of the face ``boxes``, but far too small to be a real hand at that distance."""
+    P = np.asarray(hand_px, dtype=float)[:, :2]
+    palm = np.linalg.norm(P[9] - P[0])  # wrist to middle-finger knuckle
+    return any(box.share_inside(P) >= 0.5 and palm < max_palm * box.side for box in boxes)
+
+
+def covered_regions(face_px, hands_px, share=COVERED_SHARE, pad=HAND_PAD):
+    """Names of the FACE_REGIONS that the hands (each 21 (x, y) image points) cover."""
+    covered = []
+    hulls = []
+    for hand in hands_px:
+        P = np.asarray(hand, dtype=np.float32)[:, :2]
+        hulls.append((cv2.convexHull(P), pad * float(np.linalg.norm(P[9] - P[0]))))
+    if not hulls:
+        return covered
+    for name, region in FACE_REGIONS.items():
+        under = sum(any(cv2.pointPolygonTest(hull, (float(face_px[i][0]), float(face_px[i][1])), True) >= -margin
+                        for hull, margin in hulls) for i in region)
+        if under >= share * len(region):
+            covered.append(name)
+    return covered
 
 
 def crop_face(image, box, size=INPUT_SIZE):
@@ -158,6 +206,9 @@ class FaceTrack:
         self.id = track_id
         self.position = position
         self.missed = 0
+        self.hits = 0
+        self.velocity = (0.0, 0.0)
+        self.labels = deque(maxlen=1)  # faces have no Left/Right label
         self.smoother = ExpressionSmoother(time_constant)
 
 
@@ -179,8 +230,9 @@ class FaceReading:
     expression: str  # smoothed label shown on screen; None = no expression is likely enough
     confidence: float  # smoothed probability of the most likely expression
     probabilities: np.ndarray  # smoothed, in EXPRESSIONS order
-    raw_probabilities: np.ndarray  # this frame's, in EXPRESSIONS order
+    raw_probabilities: np.ndarray  # this frame's, in EXPRESSIONS order; None while covered
     box: FaceBox
+    covered: tuple = ()  # FACE_REGIONS a hand covers; while any are, the expression is not read
 
 
 def create_face_landmarker(model_path, num_faces=1, running_mode=None):
@@ -194,7 +246,11 @@ def create_face_landmarker(model_path, num_faces=1, running_mode=None):
 
 
 class FacePipeline:
-    """Runs the face landmarker on one frame and gives each face a smoothed expression."""
+    """Runs the face landmarker on one frame and gives each face a smoothed expression.
+
+    ``detect`` finds the faces and ``read`` classifies them, so hands found in between can be
+    checked against the faces (face_phantom) and passed to ``read``: a face whose eyes or mouth
+    a hand covers keeps its last expression, unshown, instead of being read through the hand."""
 
     def __init__(self, landmarker, model, tracker=None, min_confidence=MIN_CONFIDENCE, margin=CROP_MARGIN):
         self.landmarker = landmarker
@@ -204,22 +260,41 @@ class FacePipeline:
         self.margin = margin
         self.enabled = True
         self._last_timestamp_ms = -1
+        self._frame = None  # (RGB frame, each face's landmarks in pixels, boxes) from detect
 
-    def process(self, frame_bgr, t_seconds):
+    def detect(self, frame_bgr, t_seconds):
+        """Find the faces in a frame. Returns their FaceBoxes; call ``read`` next."""
         h, w = frame_bgr.shape[:2]
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         timestamp_ms = max(int(t_seconds * 1000), self._last_timestamp_ms + 1)  # VIDEO mode needs increasing times
         self._last_timestamp_ms = timestamp_ms
         result = self.landmarker.detect_for_video(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb), timestamp_ms)
-        boxes = [face_box([(p.x * w, p.y * h) for p in face], self.margin) for face in result.face_landmarks]
-        if not boxes:
-            self.tracker.update([])
-            return []
-        raw = self.model.probabilities([crop_face(rgb, box) for box in boxes])
+        faces = [[(p.x * w, p.y * h) for p in face] for face in result.face_landmarks]
+        boxes = [face_box(face, self.margin) for face in faces]
+        self._frame = (rgb, faces, boxes)
+        return boxes
+
+    def read(self, t_seconds, hands_px=()):
+        """Expressions of the faces ``detect`` found. ``hands_px``: this frame's hands, each 21 (x, y) points."""
+        rgb, faces, boxes = self._frame
+        h, w = rgb.shape[:2]
         tracks = self.tracker.update([(box.centre[0] / w, box.centre[1] / h) for box in boxes])
+        covered = [tuple(covered_regions(face, hands_px)) for face in faces]
+        visible = [i for i, c in enumerate(covered) if not c]
+        raw = dict(zip(visible, self.model.probabilities([crop_face(rgb, boxes[i]) for i in visible]))) if visible else {}
         readings = []
-        for track, box, p in zip(tracks, boxes, raw, strict=True):
-            smoothed = track.smoother(p, t_seconds)
+        for i, (track, box) in enumerate(zip(tracks, boxes, strict=True)):
+            if covered[i]:  # keep the last smoothed expression for when the hand moves away
+                smoothed = track.smoother.value
+                confidence = 0.0 if smoothed is None else float(np.max(smoothed))
+                readings.append(FaceReading(track.id, None, confidence, smoothed, None, box, covered[i]))
+                continue
+            smoothed = track.smoother(raw[i], t_seconds)
             label, confidence = expression_label(smoothed, self.min_confidence)
-            readings.append(FaceReading(track.id, label, confidence, smoothed, p, box))
+            readings.append(FaceReading(track.id, label, confidence, smoothed, raw[i], box))
         return readings
+
+    def process(self, frame_bgr, t_seconds, hands_px=()):
+        """``detect`` and ``read`` in one step."""
+        self.detect(frame_bgr, t_seconds)
+        return self.read(t_seconds, hands_px)

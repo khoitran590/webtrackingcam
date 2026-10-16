@@ -24,8 +24,11 @@ from face_expression import (
     FacePipeline,
     FaceTracker,
     create_face_landmarker,
+    FaceBox,
+    covered_regions,
     expression_label,
     face_box,
+    face_phantom,
 )
 
 CACHE = Path(__file__).resolve().parent / ".cache" / "images"
@@ -177,6 +180,37 @@ def test_face_tracker_keeps_each_face_its_own_smoother():
     assert far.id not in (a.id, b.id)
 
 
+def flat_hand(centre, palm):
+    """21 (x, y) points of an upright open hand: wrist at the bottom, palm length ``palm``."""
+    pts = [(0.0, 0.0)] + [(dx, -palm * k) for dx in (-0.6, -0.3, 0.0, 0.3, 0.6) for k in (0.4, 0.8, 1.1, 1.4)]
+    pts[9] = (0.0, -palm)  # the middle-finger knuckle sets the palm length
+    return [(centre[0] + x * (palm if i else 1), centre[1] + y) for i, (x, y) in enumerate(pts)]
+
+
+def test_face_phantom_is_a_small_hand_inside_a_face():
+    face = FaceBox((500.0, 400.0), 200.0, 0.3)
+    assert face_phantom(flat_hand((500, 420), 30), [face])  # squashed "hand" on the face
+    assert not face_phantom(flat_hand((500, 480), 90), [face])  # a real hand held in front of it
+    assert not face_phantom(flat_hand((900, 420), 30), [face])  # small, but nowhere near the face
+    assert not face_phantom(flat_hand((500, 420), 30), [])
+
+
+def face_with_regions():
+    """478 points: each FACE_REGION as a small cluster, eyes at y=-40, mouth at y=+50, around (0, 0)."""
+    pts = np.zeros((478, 2))
+    for name, centre in {"right eye": (-40, -40), "left eye": (40, -40), "mouth": (0, 50)}.items():
+        pts[list(fe.FACE_REGIONS[name])] = np.add(centre, np.linspace(-10, 10, len(fe.FACE_REGIONS[name]))[:, None])
+    return pts + (500, 400)
+
+
+def test_covered_regions_finds_what_the_hand_is_over():
+    face = face_with_regions()
+    assert covered_regions(face, []) == []
+    assert covered_regions(face, [flat_hand((500, 520), 60)]) == ["mouth"]  # hand over the mouth
+    assert covered_regions(face, [flat_hand((460, 40), 60)]) == []  # hand above the head
+    assert set(covered_regions(face, [flat_hand((500, 560), 140)])) == set(fe.FACE_REGIONS)  # whole face
+
+
 # --- The real models on photos ---------------------------------------------------------------
 
 
@@ -255,3 +289,20 @@ def test_repeated_frames_keep_one_track_and_a_steady_label(face_models):
     assert {f[0].track_id for f in frames} == {frames[0][0].track_id}
     assert all(f[0].expression == "Happy" for f in frames)
     assert frames[-1][0].probabilities == pytest.approx(frames[-1][0].raw_probabilities, abs=0.05)
+
+
+def test_a_hand_over_the_mouth_holds_the_expression_until_it_moves_away(face_models):
+    frame = photo("portrait")
+    with create_face_landmarker(face_models[0]) as landmarker:
+        pipeline = FacePipeline(landmarker, ExpressionModel(face_models[1]))
+        [before] = pipeline.process(frame, 0.0)
+        mouth = np.asarray(pipeline._frame[1][0])[list(fe.FACE_REGIONS["mouth"])].mean(0)
+        palm = before.box.side * 0.5
+        hand = flat_hand((mouth[0], mouth[1] + palm * 0.8), palm)
+        [covered] = pipeline.process(frame, 1 / 30, [hand])
+        [after] = pipeline.process(frame, 2 / 30)
+    assert before.expression == "Happy"
+    assert "mouth" in covered.covered and covered.expression is None and covered.raw_probabilities is None
+    assert covered.track_id == before.track_id
+    assert covered.probabilities == pytest.approx(before.probabilities)  # held, not read through the hand
+    assert after.expression == "Happy" and not after.covered

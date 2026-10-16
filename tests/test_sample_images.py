@@ -250,10 +250,17 @@ class StubFaces:
     def __init__(self, expression="Happy"):
         self.enabled, self.calls, self.expression = True, 0, expression
 
-    def process(self, frame, t):
+    def detect(self, frame, t):
         self.calls += 1
+        return [FaceBox((640.0, 300.0), 200.0, 0.2)]
+
+    def read(self, t, hands_px=()):
         p = np.eye(7)[3]
         return [FaceReading(0, self.expression, 0.9, p, p, FaceBox((640.0, 300.0), 200.0, 0.2))]
+
+    def process(self, frame, t, hands_px=()):
+        self.detect(frame, t)
+        return self.read(t, hands_px)
 
 
 def test_f_key_toggles_faces_and_skips_them_while_off(headless):
@@ -290,7 +297,7 @@ class NoHands:
 
     model, use_model = None, False
 
-    def process(self, frame, t):
+    def process(self, frame, t, faces=()):
         from hand_gesture_tracker import FrameReading
 
         return FrameReading([])
@@ -345,6 +352,35 @@ def test_two_hand_label_is_voted_and_resets_when_hands_change(model_path):
     # Shown from the first frame; hidden while a hand is missing; after a gap the
     # tracks are the same hands again, so the label comes straight back.
     assert labels == ["Double Open Palm"] * 3 + [None] + ["Double Open Palm"] * 4 + [None, "Double Open Palm"]
+
+
+def test_hands_are_shown_only_once_confirmed(model_path):
+    image = load_image("left_hands")
+    with create_landmarker(model_path) as landmarker:
+        both = landmarker.detect_for_video(mp_image(image), 0)
+    none = type(both)([], [], [])
+    pipeline = GesturePipeline(ReplayLandmarker([both] * 4), mirrored=False, confirm_frames=3)
+    assert [len(pipeline.process(image, i / 30).hands) for i in range(4)] == [0, 0, 2, 2]
+    flicker = GesturePipeline(ReplayLandmarker([both, none] * 5), mirrored=False, confirm_frames=3)
+    assert all(not flicker.process(image, i / 30).hands for i in range(10))
+
+
+def test_phantom_hand_on_a_face_is_dropped(model_path):
+    from face_expression import FaceBox
+
+    image = load_image("left_hands")
+    with create_landmarker(model_path) as landmarker:
+        both = landmarker.detect_for_video(mp_image(image), 0)
+    h, w = image.shape[:2]
+    hand = np.array([(p.x * w, p.y * h) for p in both.hand_landmarks[0]])
+    palm = np.linalg.norm(hand[9] - hand[0])
+    huge_face = FaceBox(tuple(hand.mean(0)), palm * 4, 0.0)  # the hand would be too small for this face
+    other = np.array([(p.x * w, p.y * h) for p in both.hand_landmarks[1]])
+    assert huge_face.share_inside(other) < 0.5  # the box holds only the first hand
+    small_face = FaceBox(tuple(hand.mean(0)), palm * 2, 0.0)  # a face the hand is a fair size for
+    readings = [GesturePipeline(ReplayLandmarker([both]), mirrored=False).process(image, 0.0, faces).hands
+                for faces in ([huge_face], [small_face], [])]
+    assert [len(r) for r in readings] == [1, 2, 2]
 
 
 def mp_image(bgr):

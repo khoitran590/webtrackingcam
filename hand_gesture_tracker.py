@@ -41,6 +41,7 @@ from face_expression import (
     ExpressionModel,
     FacePipeline,
     create_face_landmarker,
+    face_phantom,
 )
 from face_expression import (
     MIN_CONFIDENCE as MIN_EXPRESSION_CONFIDENCE,
@@ -65,6 +66,9 @@ MAX_CONSECUTIVE_READ_FAILURES = 60  # ~2 s at 30 fps; cameras often drop frames 
 # and kettles. Still photos cannot show whether a phantom would persist through video tracking.
 MIN_HAND_DETECTION_CONFIDENCE = 0.3
 MIN_HAND_PRESENCE_CONFIDENCE = 0.3
+# Frames in a row a new hand must be seen before it is shown (about 0.1 s at 30 fps). The low
+# confidences above let in the odd phantom; a phantom that flickers in and out never gets shown.
+HAND_CONFIRM_FRAMES = 3
 
 GREEN, WHITE, BLACK, ORANGE, MAGENTA, CYAN = (0, 255, 0), (255, 255, 255), (0, 0, 0), (0, 165, 255), (255, 0, 255), (255, 255, 0)
 
@@ -153,19 +157,21 @@ class GesturePipeline:
     """Runs the landmarker on one frame and turns its output into per-hand readings.
 
     With a GestureModel, each hand's label combines the rules with the model (see
-    gesture_model.combine); ``use_model`` switches back to the rules alone."""
+    gesture_model.combine); ``use_model`` switches back to the rules alone. A hand is only
+    reported once it has been seen in ``confirm_frames`` frames in a row (1 for still photos)."""
 
-    def __init__(self, landmarker, mirrored=True, tracker=None, model=None):
+    def __init__(self, landmarker, mirrored=True, tracker=None, model=None, confirm_frames=1):
         self.landmarker = landmarker
         self.mirrored = mirrored
-        self.tracker = tracker or HandTracker()
+        self.tracker = tracker or HandTracker(confirm_frames=confirm_frames)
         self.model = model
         self.use_model = model is not None
         self._last_timestamp_ms = -1
         self._pair = None  # track ids of the two hands the pair vote belongs to
         self._pair_vote = None
 
-    def process(self, frame_bgr, t_seconds):
+    def process(self, frame_bgr, t_seconds, faces=()):
+        """``faces``: FaceBoxes found in this frame; hands that are phantoms on them are dropped."""
         h, w = frame_bgr.shape[:2]
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         # VIDEO mode rejects timestamps that do not strictly increase.
@@ -176,7 +182,10 @@ class GesturePipeline:
         image_hands = [[(p.x, p.y, p.z) for p in hand] for hand in result.hand_landmarks]
         world_hands = [[(p.x, p.y, p.z) for p in hand] for hand in result.hand_world_landmarks]
         labels = [categories[0].category_name for categories in result.handedness]
-        tracks = self.tracker.update([hand[WRIST][:2] for hand in image_hands])
+        if faces:
+            real = [i for i, hand in enumerate(image_hands) if not face_phantom([(x * w, y * h) for x, y, _ in hand], faces)]
+            image_hands, world_hands, labels = ([items[i] for i in real] for items in (image_hands, world_hands, labels))
+        tracks = self.tracker.update([hand[WRIST][:2] for hand in image_hands], labels)
 
         readings = []
         for track, image_pts, world_pts, label in zip(tracks, image_hands, world_hands, labels, strict=True):
@@ -190,10 +199,13 @@ class GesturePipeline:
                 # The model needs the label as MediaPipe saw it (what the hand looks like in this image).
                 guess = self.model.predict(hand_features(points_px, world_pts, label))
                 raw = combine(rule, fingers, thumb_dir, *guess, self.model.thresholds)
+            gesture = track.vote.update(raw)
+            if not self.tracker.confirmed(track):
+                continue
             readings.append(HandReading(
                 track_id=track.id,
                 handedness=user_handedness(label, self.mirrored),
-                gesture=track.vote.update(raw),
+                gesture=gesture,
                 raw_gesture=raw,
                 fingers=fingers,
                 pinch=pinch,
@@ -247,9 +259,12 @@ def draw_face(frame, reading, placed=None):
     h, w = frame.shape[:2]
     corners = [(int(round(x)), int(round(y))) for x, y in reading.box.corners()]
     cv2.polylines(frame, [np.array(corners, np.int32)], True, CYAN, 2, cv2.LINE_AA)
-    if not reading.expression:
+    if reading.covered:
+        text = "Face covered"
+    elif reading.expression:
+        text = f"{reading.expression} {reading.confidence:.0%}"
+    else:
         return
-    text = f"{reading.expression} {reading.confidence:.0%}"
     (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
     origin = label_origin(corners, (tw, th), (w, h), top=HUD_HEIGHT)
     if placed is not None:
@@ -349,8 +364,11 @@ def run(cap, pipeline, max_frames=None, faces=None):
 
         frame = cv2.flip(frame, 1)  # mirror view; GesturePipeline(mirrored=True) corrects the labels
         now = time.monotonic()
-        result = pipeline.process(frame, now)
-        face_readings = faces.process(frame, now) if faces is not None and faces.enabled else []
+        # Faces first, so phantom hands on them can be dropped; then the expressions, which
+        # are not read while a hand covers the eyes or mouth.
+        reading_faces = faces is not None and faces.enabled
+        result = pipeline.process(frame, now, faces.detect(frame, now) if reading_faces else ())
+        face_readings = faces.read(now, [h.points_px for h in result.hands]) if reading_faces else []
         placed = []
         for reading in result.hands:
             draw_hand(frame, reading, placed)
@@ -426,7 +444,8 @@ def main(argv=None):
                                      min_confidence=args.min_expression_confidence)
             w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             print(f"Tracking active on camera {args.camera} at {w}x{h}. Press 'q' or Esc to exit.")
-            pipeline = GesturePipeline(landmarker, mirrored=True, model=gesture_model)
+            pipeline = GesturePipeline(landmarker, mirrored=True, model=gesture_model,
+                                       confirm_frames=HAND_CONFIRM_FRAMES)
             pipeline.use_model = gesture_model is not None and not args.rules_only
             frames, fps = run(cap, pipeline, args.max_frames, faces)
             print(f"Processed {frames} frames at {fps:.1f} FPS.")

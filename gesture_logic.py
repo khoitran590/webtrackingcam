@@ -12,6 +12,7 @@ Thresholds were calibrated on 1,700 photos from the HaGRID v2 test split (100 pe
 class) and checked on a held-out 1,700 from other shards; see tools/evaluate_hagrid.py.
 """
 
+import itertools
 import math
 from collections import Counter, deque, namedtuple
 
@@ -276,22 +277,38 @@ class HandTrack:
         self.id = track_id
         self.position = position
         self.missed = 0
+        self.hits = 0  # frames this track has been matched in
+        self.velocity = (0.0, 0.0)  # smoothed movement per frame
+        self.labels = deque(maxlen=10)  # recent Left/Right labels MediaPipe gave this hand
         self.vote = GestureVote(vote_size)
         self.smoother = LandmarkSmoother(**smoothing)
 
 
 class HandTracker:
-    """Gives each detected hand a stable identity by matching it to the nearest wrist from
-    the previous frames. This is more reliable than keying on the Left/Right label, which
-    MediaPipe occasionally gives to both hands at once. Subclasses can track other things
-    (faces) by overriding ``new_track``."""
+    """Gives each detected hand a stable identity across frames. Each track's wrist is
+    predicted from its recent movement, and this frame's hands are matched to the predictions
+    so the total distance is smallest, plus a small penalty for a Left/Right label that
+    disagrees with the track's usual one. The label is only a tie-breaker: MediaPipe
+    occasionally gives both hands the same label. Subclasses can track other things (faces)
+    by overriding ``new_track``.
+
+    In a simulation of two real HaGRID hands passing each other at 0.5-2 frame-widths per
+    second (landmark jitter, dropped frames, the nearer hand hidden half the time while they
+    overlap, 5% of labels flipped), a shown hand's identity swapped in 6-10 of 102 crossings
+    instead of 66-72 with nearest-wrist matching (see SPEC_NOTES.md, H1). Velocity alone made
+    hands that meet and part swap more (it predicts they pass through); the label penalty is
+    what fixes crossings, and above about 0.03 it pulled hands moving side by side apart."""
 
     # Normalized-coordinate units: a hand moving fast covers ~2 frame-widths per second.
     DEFAULT_SMOOTHING = {"min_cutoff": 1.0, "beta": 10.0, "d_cutoff": 1.0}
+    LABEL_COST = 0.03  # added distance (frame widths) for a label that disagrees with the track's
+    MAX_PREDICTED_FRAMES = 3  # a lost track is not extrapolated further than this
+    EXHAUSTIVE_LIMIT = 3  # up to this many detections, try every matching; beyond it, match greedily
 
-    def __init__(self, max_jump=0.25, max_missed=10, vote_size=5, smoothing=None):
+    def __init__(self, max_jump=0.25, max_missed=10, vote_size=5, smoothing=None, confirm_frames=1):
         self.max_jump = max_jump
         self.max_missed = max_missed
+        self.confirm_frames = confirm_frames
         self.vote_size = vote_size
         self.smoothing = smoothing or self.DEFAULT_SMOOTHING
         self.tracks = []
@@ -300,33 +317,72 @@ class HandTracker:
     def new_track(self, track_id, position):
         return HandTrack(track_id, position, self.vote_size, self.smoothing)
 
-    def update(self, wrists):
-        """Match this frame's wrist positions (normalized x, y) to tracks.
+    def confirmed(self, track):
+        """Whether ``track`` has been seen in ``confirm_frames`` frames in a row since it began.
+        Until then it is tentative, and a tentative track that misses a frame is dropped, so a
+        detection that flickers in and out (a phantom) never gets confirmed."""
+        return track.hits >= self.confirm_frames
+
+    def _cost(self, position, label, track):
+        """Distance from the track's predicted position, plus the label penalty; None if too far."""
+        k = min(track.missed + 1, self.MAX_PREDICTED_FRAMES)
+        predicted = (track.position[0] + track.velocity[0] * k, track.position[1] + track.velocity[1] * k)
+        cost = math.dist(position, predicted)
+        if cost > self.max_jump:
+            return None
+        usual = Counter(l for l in track.labels if l).most_common(1)
+        if label and usual and usual[0][0] != label:
+            cost += self.LABEL_COST
+        return cost
+
+    def _match(self, positions, labels):
+        """{detection index: track index}: as many matches as possible, then the lowest total cost."""
+        costs = {(i, j): c for i, (p, l) in enumerate(zip(positions, labels)) for j, t in enumerate(self.tracks)
+                 if (c := self._cost(p, l, t)) is not None}
+        if len(positions) > self.EXHAUSTIVE_LIMIT:
+            match = {}
+            for (i, j), _ in sorted(costs.items(), key=lambda item: (item[1], item[0])):
+                if i not in match and j not in match.values():
+                    match[i] = j
+            return match
+        best, best_key = {}, (0, 0.0)
+        options = [[None] + [j for j in range(len(self.tracks)) if (i, j) in costs] for i in range(len(positions))]
+        for choice in itertools.product(*options):
+            chosen = [j for j in choice if j is not None]
+            if len(chosen) != len(set(chosen)):
+                continue
+            key = (-len(chosen), sum(costs[i, j] for i, j in enumerate(choice) if j is not None))
+            if key < best_key:
+                best, best_key = {i: j for i, j in enumerate(choice) if j is not None}, key
+        return best
+
+    def update(self, wrists, labels=None):
+        """Match this frame's wrist positions (normalized x, y), and optionally MediaPipe's
+        Left/Right label for each, to tracks.
 
         Returns one track per wrist, in the same order as ``wrists``.
         """
-        pairs = sorted(
-            ((math.dist(w, track.position), i, track) for i, w in enumerate(wrists) for track in self.tracks),
-            key=lambda p: (p[0], p[1], p[2].id),
-        )
-        assigned = [None] * len(wrists)
-        used = set()
-        for d, i, track in pairs:
-            if d > self.max_jump:
-                break
-            if assigned[i] is None and track.id not in used:
-                assigned[i] = track
-                used.add(track.id)
+        labels = list(labels) if labels is not None else [None] * len(wrists)
+        match = self._match(wrists, labels)
+        assigned = [self.tracks[match[i]] if i in match else None for i in range(len(wrists))]
         for i, w in enumerate(wrists):
-            if assigned[i] is None:
-                assigned[i] = self.new_track(self._next_id, w)
+            track = assigned[i]
+            if track is None:
+                track = assigned[i] = self.new_track(self._next_id, w)
                 self._next_id += 1
-                self.tracks.append(assigned[i])
-            assigned[i].position = w
-            assigned[i].missed = 0
+                self.tracks.append(track)
+            else:
+                steps = track.missed + 1
+                step = ((w[0] - track.position[0]) / steps, (w[1] - track.position[1]) / steps)
+                track.velocity = tuple(0.5 * v + 0.5 * d for v, d in zip(track.velocity, step))
+            track.labels.append(labels[i])
+            track.position = w
+            track.missed = 0
+            track.hits += 1
         matched = {t.id for t in assigned}
         for track in self.tracks:
             if track.id not in matched:
                 track.missed += 1
-        self.tracks = [t for t in self.tracks if t.missed <= self.max_missed]
+        self.tracks = [t for t in self.tracks
+                       if t.missed == 0 or (t.missed <= self.max_missed and self.confirmed(t))]
         return assigned
