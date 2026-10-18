@@ -3,6 +3,7 @@
 The model and images are downloaded on first run into models/ and tests/.cache/.
 """
 
+import json
 import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
@@ -456,6 +457,34 @@ def test_recorder_records_a_take_that_training_can_read(model_path, headless, tm
     hagrid_class, _, points_px, world, _ = loaded[0]
     assert train_gesture_model.rule_inputs(points_px, world)[0] == "Fist"
     assert train_gesture_model.is_correct("Fist", hagrid_class)
+
+
+def test_recorder_saves_frames_with_extra_hands(model_path, headless, tmp_path, monkeypatch):
+    """With extra_hands_dir, a palm take on a two-hand photo saves each frame's image and hands."""
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parent.parent / "tools"))
+    import record_samples
+
+    monkeypatch.setattr(record_samples.cv2, "imshow", lambda *a: None)
+    monkeypatch.setattr(record_samples.cv2, "waitKey", lambda *a: keys.pop(0) if keys else -1)
+    monkeypatch.setattr(record_samples, "window_visible", lambda: True)
+    keys = [-1, ord("7")]
+    ticks = iter(i * 0.5 for i in range(1000))
+    frame = load_image("left_hands")
+    recorder = record_samples.Recorder(tmp_path, extra_hands_dir=tmp_path / "extra_hands")
+    with create_landmarker(model_path) as landmarker:
+        record_samples.record(FakeCapture([(True, frame.copy()) for _ in range(20)]),
+                              GesturePipeline(landmarker), recorder, max_frames=20, clock=lambda: next(ticks))
+    [folder] = (tmp_path / "extra_hands").iterdir()
+    assert folder.name.startswith("palm-")
+    assert len(list(folder.glob("*.jpg"))) == len(list(folder.glob("*.json"))) == 8
+    saved = json.loads(sorted(folder.glob("*.json"))[0].read_text())
+    assert saved["class"] == "palm" and len(saved["hands"]) == 2
+    assert all(0 < h["label_score"] <= 1 and len(h["points_px"]) == 21 for h in saved["hands"])
+    assert cv2.imread(str(sorted(folder.glob("*.jpg"))[0])).shape == frame.shape  # the clean camera frame
+    assert "8 frames with extra hands saved to" in recorder.reports[0]
+    rows = record_samples.load_takes(tmp_path)[recorder.saved[0]]
+    assert len({r["track_id"] for r in rows}) == 2
+    assert record_samples.takes_per_class(tmp_path) == {"palm": 1}  # the folder is not read as takes
 
 
 def test_recorder_ignores_new_keys_while_recording(tmp_path, monkeypatch):

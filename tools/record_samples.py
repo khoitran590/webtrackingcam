@@ -13,7 +13,7 @@ Both then learn from your takes as well as the public photos and report on them 
   your resting face (looking at the screen as you would while using the app) and matters most.
 - 3-5 takes per class, on different days or in different light, is a good start.
 
-    .venv/bin/python tools/record_samples.py [--camera 0]
+    .venv/bin/python tools/record_samples.py [--camera 0] [--save-extra-hands]
     .venv/bin/python tools/train_gesture_model.py        # retrain with your gesture takes included
     .venv/bin/python tools/fit_expression_offsets.py     # refit the expression offsets with your face takes
 
@@ -70,10 +70,13 @@ FACE_SET = {cls for cls, _ in FACE_CLASSES.values()}
 class Recorder:
     """Countdown, then collect every visible hand for ``duration`` seconds, then save the take."""
 
-    def __init__(self, out_dir, countdown=2.0, duration=4.0, face_offsets=CLASS_OFFSETS):
+    def __init__(self, out_dir, countdown=2.0, duration=4.0, face_offsets=CLASS_OFFSETS, extra_hands_dir=None):
+        """``extra_hands_dir``: if given, frames of a gesture take that show more than one hand are
+        saved there (camera image + every hand's landmarks and scores), to study phantom hands."""
         self.out_dir, self.countdown, self.duration = Path(out_dir), countdown, duration
         self.face_offsets = np.asarray(face_offsets, dtype=float)
-        self.cls = self.started = None
+        self.extra_hands_dir = Path(extra_hands_dir) if extra_hands_dir else None
+        self.cls = self.started = self.take_name = None
         self.rows = []
         self.saved = []  # paths of finished takes
         self.reports = []  # one line per finished take, also printed as it happens
@@ -81,16 +84,19 @@ class Recorder:
 
     def _reset(self):
         self.frames = self.found = self.covered = self.extra_hands = 0  # frames seen while recording
+        self.extra_saved = 0  # frames written to extra_hands_dir
         self.shown = Counter()  # what the app showed for the face or hand being recorded
 
     def start(self, cls, now):
         if self.cls is None:
             self.cls, self.started, self.rows = cls, now, []
+            self.take_name = f"{cls}-{time.strftime('%Y%m%d-%H%M%S')}"
             self._reset()
             print(f"Take started: {self.cls}", flush=True)
 
-    def update(self, reading, frame_size, now, faces=()):
-        """Feed one frame's FrameReading and FaceReadings. Returns the status line to show, or None when idle."""
+    def update(self, reading, frame_size, now, faces=(), frame=None):
+        """Feed one frame's FrameReading and FaceReadings, and the camera frame before anything is
+        drawn on it (needed only with ``extra_hands_dir``). Returns the status line to show, or None when idle."""
         if self.cls is None:
             return None
         elapsed = now - self.started
@@ -114,7 +120,10 @@ class Recorder:
             for hand in reading.hands:
                 self.shown[hand.gesture or "no label"] += 1
                 self.rows.append({"class": self.cls, "image_label": hand.image_label, "size": list(frame_size),
-                                  "points_px": [list(p) for p in hand.points_px], "world": [list(p) for p in hand.world_points]})
+                                  "points_px": [list(p) for p in hand.points_px], "world": [list(p) for p in hand.world_points],
+                                  "track_id": hand.track_id})
+            if self.extra_hands_dir and frame is not None and len(reading.hands) > 1 and self.cls != "none":
+                self._save_extra_hands(reading, frame)
             return f"RECORDING {self.cls}: {len(self.rows)} hands"
         self._save()
         return None
@@ -135,7 +144,21 @@ class Recorder:
             problems.append(f"two hands in view in {self.extra_hands / frames:.0%} of frames; rest the other one out of view")
         if not self.rows:
             problems.append("nothing saved")
+        if self.extra_saved:
+            line += f"\n  {self.extra_saved} frames with extra hands saved to {self.extra_hands_dir / self.take_name}"
         return line + "".join(f"\n  WARNING: {p}" for p in problems)
+
+    def _save_extra_hands(self, reading, frame):
+        folder = self.extra_hands_dir / self.take_name
+        folder.mkdir(parents=True, exist_ok=True)
+        stem = folder / f"{self.frames:03d}"
+        cv2.imwrite(str(stem.with_suffix(".jpg")), frame)
+        hands = [{"track_id": h.track_id, "image_label": h.image_label, "label_score": h.label_score,
+                  "gesture": h.gesture, "raw_gesture": h.raw_gesture, "model_guess": h.model_guess,
+                  "points_px": [list(p) for p in h.points_px], "world": [list(p) for p in h.world_points]}
+                 for h in reading.hands]
+        stem.with_suffix(".json").write_text(json.dumps({"class": self.cls, "hands": hands}))
+        self.extra_saved += 1
 
     def _save(self):
         line = self.report()
@@ -203,7 +226,7 @@ def record(cap, pipeline, recorder, max_frames=None, clock=time.monotonic, faces
         reading = pipeline.process(frame, now, faces.detect(frame, now) if faces else ())
         face_readings = faces.read(now, [h.points_px for h in reading.hands]) if faces else []
         saved = len(recorder.saved)
-        status = recorder.update(reading, (frame.shape[1], frame.shape[0]), now, face_readings)
+        status = recorder.update(reading, (frame.shape[1], frame.shape[0]), now, face_readings, frame)
         if len(recorder.saved) != saved:
             counts = takes_per_class(recorder.out_dir)
         placed = []
@@ -239,6 +262,8 @@ def main(argv=None):
     parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--out", type=Path, default=SAMPLES)
     parser.add_argument("--no-faces", action="store_true", help="gestures only")
+    parser.add_argument("--save-extra-hands", action="store_true",
+                        help="save frames of gesture takes that show more than one hand to <out>/extra_hands")
     args = parser.parse_args(argv)
 
     model = GestureModel.load(DEFAULT_CLASSIFIER_PATH) if DEFAULT_CLASSIFIER_PATH.exists() else None
@@ -250,7 +275,7 @@ def main(argv=None):
             faces = None
             if face_paths:
                 faces = FacePipeline(stack.enter_context(create_face_landmarker(face_paths[0])), ExpressionModel(face_paths[1]))
-            recorder = Recorder(args.out)
+            recorder = Recorder(args.out, extra_hands_dir=args.out / "extra_hands" if args.save_extra_hands else None)
             record(cap, GesturePipeline(landmarker, mirrored=True, model=model, confirm_frames=HAND_CONFIRM_FRAMES),
                    recorder, faces=faces)
     except KeyboardInterrupt:

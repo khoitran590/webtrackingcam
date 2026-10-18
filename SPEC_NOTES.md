@@ -74,16 +74,17 @@ Rules alone → the app (rules + model):
 |---|---|---|---|
 | OK Sign | ok | 92% → 98% | 92% → 98% |
 | Rock On / Spider-Man / ILY | rock (HaGRID mixes thumb in and out) | 88% → 90% | 93% → 96% |
-| **Call Me** *(new: thumb and pinky)* | call | 83% → 90% | **74% → 90%** |
-| **L Shape** *(new: thumb and index)* | thumb_index | 92% → 94% | 98% → 98% |
-| Thumbs Up | like | 82% → 89% | 86% → 90% |
-| Thumbs Down | dislike | 76% → 78% | **84% → 82%** |
-| Fist | fist | 90% → 92% | 82% → 86% |
-| Open Palm, Peace / Victory, Pointing | palm, peace, one | 98/93/92% → 97/93/93% | 93/93/92% → 94/91/93% |
-| **Mean of the 10** | | **88.6% → 91.4%** | **88.7% → 91.8%** |
+| **Call Me** *(new: thumb and pinky)* | call | 83% → 89% | **74% → 92%** |
+| **L Shape** *(new: thumb and index)* | thumb_index | 92% → 93% | 98% → 98% |
+| Thumbs Up | like | 82% → 88% | 86% → 90% |
+| Thumbs Down | dislike | 76% → 78% | 84% → 84% |
+| Fist | fist | 90% → 92% | 82% → 88% |
+| Open Palm, Peace / Victory, Pointing | palm, peace, one | 98/93/92% → 98/94/94% | 93/93/92% → 94/93/94% |
+| **Mean of the 10** | | **88.6% → 91.4%** | **88.7% → 92.7%** |
 
-Photo by photo, the model fixes 24 held-out gesture photos and breaks 4: +2.5 points, 95% bootstrap interval
-+1.3 to +3.9 (calibration set: 33 fixed, 5 broken, +2.8 points, +1.7 to +4.0).
+Photo by photo, the model fixes 26 held-out gesture photos and breaks none: +3.2 points, 95% bootstrap interval
++2.1 to +4.5 (calibration set: 31 fixed, 3 broken, +2.8 points, +1.7 to +4.0). These are for the model shipped
+in E9; the one before it fixed 24 and broke 4 held-out photos (+2.5).
 
 **Two-hand gestures** (new). Shown as a "Both hands: …" banner and majority-voted like single-hand labels.
 The vote restarts whenever the pair of hands changes. The rules decide these alone. The first number counts every
@@ -104,7 +105,7 @@ photos (a Heart fired on a Frame photo).
 | # | Finding | Status |
 |---|---------|--------|
 | D1 | **Prayer is mostly limited by detection.** Palms pressed together often look like one hand to MediaPipe. Lower detection thresholds (E5) raised Prayer on held-out photos from 26% (the app's old settings; 36% at the 0.5 used for earlier measurements) to 52%; the rule is right 98–100% of the time once both hands are found. | **Open**: needs a different detector or a one-hand fallback. |
-| D2 | Call Me was the weakest single-hand gesture (68% held-out), mostly because the thumb isn't detected as extended. | **Resolved** by the learned model: 90%. |
+| D2 | Call Me was the weakest single-hand gesture (68% held-out), mostly because the thumb isn't detected as extended. | **Resolved** by the learned model: 89–92%. |
 | D3 | **Rock On vs. Spider-Man / ILY differ only by the thumb**, and HaGRID's "rock" photos include both. The split between them can't be scored against ground truth. The model has one "rock" class; the rules' thumb state picks the name. | **Open**: no ILY photos to validate against. |
 | D4 | *(Found on a real photo.)* An upright and an upside-down open hand next to each other read as **Frame**. | **Resolved**: Frame excludes hands with middle, ring and pinky all extended. Covered by a unit test and a real-photo test. |
 | D5 | *(Found when rendering.)* With two hands close together, as in every two-hand gesture, the two hand labels were drawn on top of each other. | **Resolved**: see C1. |
@@ -125,12 +126,15 @@ direction, thumb in/out (Rock On vs. ILY), finger counts and all two-hand gestur
 
 | # | Finding | Status |
 |---|---------|--------|
-| E1 | **The rules name every hand**, so a relaxed hand reads as Fist or Open Palm: 76% of HaGRID "no gesture" photos got a gesture name. | **Improved**: the model hides the label of a hand it is ≥80% sure is idle: 18–23%. |
+| E1 | **The rules name every hand**, so a relaxed hand reads as Fist or Open Palm: 76% of HaGRID "no gesture" photos got a gesture name. | **Improved**: the model hides the label of a hand it is ≥80% sure is idle: 16–27%. |
 | E2 | **Shapes the app has no name for got a wrong name** 29–32% of the time; a pen grip got one in 94–98% of photos (on training photos, mostly Thumbs Up). Falling back to the rules whenever the model said "other" kept that error: on training data, 97% of grips were still named. | **Resolved**: when the model is sure of "other", finger counts still show but gesture names don't: 10%. |
 | E3 | **A model on raw landmarks fails on rotated hands**: trained on mostly upright hands, it recognised 98% of upright held-out hands but 0–2% of the same hands turned 90° or 180°. Giving it the hand's angle as an extra input brought the problem back (54% at 180°). | **Resolved**: hands are turned upright first (98% at every angle). Unit-tested. |
 | E4 | **HaGRID's idle hands are far away and hanging at people's sides.** Every model trained on them called close-up, spread open palms (the sample photos) "no gesture", the larger networks with up to 99% confidence. Mirroring training hands to simulate the back of the hand, adding the hand angle, and a finger-spread rule did not fix it. | **Open**: the "no gesture" gate needs ≥80% confidence (the 64-unit model peaks at 77% on those palms; larger models were picked against for this). Recalibrate with your own takes (`tools/record_samples.py`). |
 | E5 | **The live app used stricter MediaPipe settings than every measurement**: detection 0.7 vs. 0.5. At 0.7, 89.6% of held-out gesture photos had a hand found instead of 94.2%, and two-hand gestures dropped from 76% to 64%. | **Resolved**: detection and presence 0.3 for both the app and the evaluator. That finds a hand in 96.0%, both hands of a two-hand gesture in 86% (was 67%). About 0.3% of photos gain a phantom "hand"; at 0.2, faces and kettles were detected too. `--min-detection` adjusts it live. |
 | E6 | **First live retrain (2026-10-17)** with 6 takes (601 hands): 3 "no gesture" and 3 Open Palm. Live, the shipped model labelled the relaxed hands correctly in 40% of frames (else Open Palm, 4 Fingers Up, Thumb Out). Retrained, each take held out: 45%, HaGRID no_gesture 64.7% -> 73.5%, but Pointing 82.9% -> 74.4%, and MediaPipe's back-of-hand Open Palm photos read "no gesture" at 82-92% (over the 0.8 gate), so they lost their label. With the gate at 0.93 the photos pass but the relaxed hands fall to 30%. | **Open**: shipped model kept. The relaxed-hand takes were mostly open hands; record curled or half-closed idle hands (typing, phone, chin on hand) and back-of-hand Open Palms, then retrain. |
+| E7 | **Second live retrain (2026-10-17)** with 16 takes: 6 "no gesture", 7 Open Palm, 3 Pointing. Scored with each take held out, the retrained model got the "no gesture" takes right in 63% of frames vs. the shipped model's 66%. Per take it moved errors rather than removing them: open relaxed hands improved (14% -> 31%), but a curled resting hand the shipped model got 100% right read as Fist (56%), and another as Call Me. Open Palm and Pointing takes: 100% for both. HaGRID no_gesture 64.7% -> 73.0%, middle_finger 93.3% -> 88.1%. Back-of-hand palm photos passed, one at P(none) 0.80, right at the gate. | **Shipped model kept.** As still shapes, a relaxed open hand is close to Open Palm and a curled one to Fist; more takes swing single takes by up to 40 points. The takes stay in `samples/` for later retrains. |
+| E8 | **Averaging the hand model's probabilities over time** (as faces do, F) was simulated on the 16 takes with the shipped model, before the 5-frame vote. Time constants 0.1-0.5 s: shown-label accuracy 85.0% -> 83.7-84.3% ("no gesture" takes 67.0% -> 63.9-65.4%), label changes 31 -> 21-26, and the label took longer to clear when a hand stopped gesturing (0.10 s -> 0.31 s at 0.1 s, 0.78 s at 0.3 s), because the averaged "no gesture" probability has to climb to the 0.8 gate. The model's mistakes last whole takes, so averaging doesn't fix them. | **Not adopted.** The takes are steady 4 s holds; flicker while a hand moves between shapes is unmeasured. |
+| E9 | **Third live retrain (2026-10-17)**, shipped: 29 takes (2,509 hands): 6 "no gesture", 12 Open Palm, 5 Pointing, 4 Fist, 2 Call Me. The shipped model hid close-up fists: on 2 of 4 Fist takes it was ≥0.8 sure of "no gesture" (one take hidden in every frame), and on a knuckles-on fist it said Pointing, which needs only 0.4. Two guards were tried first and dropped: using the model's Pointing only when the rules see the index up broke pointing at the camera (HaGRID point 83% → 17%, your Pointing takes 100% → 68%), and never hiding a hand the rules call Fist showed curled idle hands as Fist (your "no gesture" takes 66% → 37%, HaGRID no_gesture 65% → 45%). Retrained with the takes, each take held out: Fist 45% → 87%, Call Me 53% → 77%, "no gesture" 66% → 72%, Open Palm and Pointing about 100% for both. App on HaGRID (section D): gestures 91.4% / 91.8% → 91.4% / 92.7% (calibration / held-out), no_gesture photos given a name 23% / 18% → 27% / 16%, two-hand gestures unchanged, no class moving more than 4 points. Back-of-hand palm photos: highest P(none) 0.76 → 0.68. | **Shipped.** Still weak: a knuckles-on fist (47%), and a palm-facing Call Me where MediaPipe seems to swap thumb and index landmarks (53%; the rules then see Rock On). |
 
 ## F. Facial expressions
 
@@ -222,7 +226,7 @@ changing identity.
 - **Live Left/Right labels.** Handedness is verified on photos, raw and mirrored, but not on a live mirrored webcam feed.
 - **Spider-Man / ILY on real hands.** The other gestures are measured on real photos (section D), but there is no ILY photo set with ground truth.
 - **All gestures, the learned model and the "no gesture" gate on a live webcam.** Sections D and E come from still photos of distant hands.
-- **Phantom hands in video.** At the lower detection settings (E5), a phantom detection could persist through tracking. Phantoms on faces are dropped (G1) and flickering ones are never shown (G2), but a phantom detected steadily for 3 frames away from any face would still be shown.
+- **Phantom hands in video.** At the lower detection settings (E5), a phantom detection could persist through tracking. Phantoms on faces are dropped (G1) and flickering ones are never shown (G2), but a phantom detected steadily for 3 frames away from any face would still be shown. One was seen live (2026-10-17): a curled "hand" about 0.7 times the size of the real one, right beside its little-finger side, in 20 of 76 frames of one Open Palm take. It did not come back in 13 one-hand takes recorded with `--save-extra-hands`, so there are no images of it yet.
 - **Hand identities through crossings on live video** (H1). The simulation's label-flip rate is an assumption.
 - **Smoothing settings.** The One-Euro values (`min_cutoff=1.0, beta=10`) were set by reasoning about units, not tuned on live video.
 - **Facial expressions on a live webcam.** Section F comes from still photos of other people. The 0.3 s smoothing,

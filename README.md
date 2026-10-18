@@ -99,7 +99,8 @@ This downloads 33 MB (RAF-DB) or 108 MB (AffectNet) of face photos from unoffici
 
 ## Training the model on your own hands
 
-The shipped model learned from 10,447 photos of other people, mostly far from the camera. Your own takes
+The shipped model learned from 10,447 photos of other people, mostly far from the camera, plus 29 webcam takes
+of one person's hands (SPEC_NOTES E9). Your own takes
 teach it your hands, camera and light, and are the way to calibrate when a hand counts as "not a gesture":
 
 ```bash
@@ -111,6 +112,10 @@ uv pip install -r requirements-train.txt
 Takes are saved in `samples/` (not committed). Training reports accuracy on your own takes separately.
 Record "no gesture" (your hands doing ordinary things) and Open Palm first; with them,
 `--min-none-confidence` can be lowered from its cautious default of 0.8.
+
+With `--save-extra-hands`, a gesture take (other than "no gesture") that shows more than one hand also saves
+each such frame's camera image and every hand's landmarks and scores to `samples/extra_hands/`. Show one hand
+only, and these frames catch phantom hands, so a filter for them can be designed from real examples.
 
 The same window records facial expressions (letter keys, shown on the right; `n` is your resting face, the
 one that matters most). Face takes go to `samples/faces/` and keep only the network's scores, no images.

@@ -145,6 +145,7 @@ class HandReading:
     model_guess: tuple = None  # (class, confidence) from the learned model, when it is in use
     world_points: list = None  # MediaPipe's 21 world points (metres)
     image_label: str = None  # MediaPipe's handedness for this (possibly mirrored) frame
+    label_score: float = None  # MediaPipe's confidence in image_label
 
 
 @dataclass
@@ -182,13 +183,14 @@ class GesturePipeline:
         image_hands = [[(p.x, p.y, p.z) for p in hand] for hand in result.hand_landmarks]
         world_hands = [[(p.x, p.y, p.z) for p in hand] for hand in result.hand_world_landmarks]
         labels = [categories[0].category_name for categories in result.handedness]
+        scores = [categories[0].score for categories in result.handedness]
         if faces:
             real = [i for i, hand in enumerate(image_hands) if not face_phantom([(x * w, y * h) for x, y, _ in hand], faces)]
-            image_hands, world_hands, labels = ([items[i] for i in real] for items in (image_hands, world_hands, labels))
+            image_hands, world_hands, labels, scores = ([items[i] for i in real] for items in (image_hands, world_hands, labels, scores))
         tracks = self.tracker.update([hand[WRIST][:2] for hand in image_hands], labels)
 
         readings = []
-        for track, image_pts, world_pts, label in zip(tracks, image_hands, world_hands, labels, strict=True):
+        for track, image_pts, world_pts, label, score in zip(tracks, image_hands, world_hands, labels, scores, strict=True):
             points_px = [(x * w, y * h) for x, y, _ in track.smoother(image_pts, t_seconds)]
             fingers = finger_states(world_pts)
             pinch = pinch_ratio(points_px)
@@ -214,6 +216,7 @@ class GesturePipeline:
                 model_guess=guess,
                 world_points=world_pts,
                 image_label=label,
+                label_score=score,
             ))
         return FrameReading(readings, self._two_hand_gesture(readings))
 
