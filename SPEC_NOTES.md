@@ -52,7 +52,7 @@ Every photo gives the same result when mirrored, as the live app does.
 | C6 | On macOS, a missing camera permission shows up as a bare "Could not access the webcam". | **Resolved**: the error explains where to grant access. Confirmed on this machine, where the terminal has no permission yet. |
 | C7 | Camera index 0 is hard-coded. | **Resolved**: `--camera N`. |
 | C8 | Tasks `VIDEO` mode needs strictly increasing timestamps. | **Resolved** |
-| C9 | No tests. | **Resolved**: 217 tests (`pytest`), plus `tools/evaluate_hagrid.py` and `tools/evaluate_faces.py`, which measure accuracy on real photos (sections D, E, F and G). |
+| C9 | No tests. | **Resolved**: 218 tests (`pytest`), plus `tools/evaluate_hagrid.py` and `tools/evaluate_faces.py`, which measure accuracy on real photos (sections D, E, F and G). |
 
 ## D. Gestures added after the spec, and accuracy on real photos
 
@@ -130,6 +130,7 @@ direction, thumb in/out (Rock On vs. ILY), finger counts and all two-hand gestur
 | E3 | **A model on raw landmarks fails on rotated hands**: trained on mostly upright hands, it recognised 98% of upright held-out hands but 0–2% of the same hands turned 90° or 180°. Giving it the hand's angle as an extra input brought the problem back (54% at 180°). | **Resolved**: hands are turned upright first (98% at every angle). Unit-tested. |
 | E4 | **HaGRID's idle hands are far away and hanging at people's sides.** Every model trained on them called close-up, spread open palms (the sample photos) "no gesture", the larger networks with up to 99% confidence. Mirroring training hands to simulate the back of the hand, adding the hand angle, and a finger-spread rule did not fix it. | **Open**: the "no gesture" gate needs ≥80% confidence (the 64-unit model peaks at 77% on those palms; larger models were picked against for this). Recalibrate with your own takes (`tools/record_samples.py`). |
 | E5 | **The live app used stricter MediaPipe settings than every measurement**: detection 0.7 vs. 0.5. At 0.7, 89.6% of held-out gesture photos had a hand found instead of 94.2%, and two-hand gestures dropped from 76% to 64%. | **Resolved**: detection and presence 0.3 for both the app and the evaluator. That finds a hand in 96.0%, both hands of a two-hand gesture in 86% (was 67%). About 0.3% of photos gain a phantom "hand"; at 0.2, faces and kettles were detected too. `--min-detection` adjusts it live. |
+| E6 | **First live retrain (2026-10-17)** with 6 takes (601 hands): 3 "no gesture" and 3 Open Palm. Live, the shipped model labelled the relaxed hands correctly in 40% of frames (else Open Palm, 4 Fingers Up, Thumb Out). Retrained, each take held out: 45%, HaGRID no_gesture 64.7% -> 73.5%, but Pointing 82.9% -> 74.4%, and MediaPipe's back-of-hand Open Palm photos read "no gesture" at 82-92% (over the 0.8 gate), so they lost their label. With the gate at 0.93 the photos pass but the relaxed hands fall to 30%. | **Open**: shipped model kept. The relaxed-hand takes were mostly open hands; record curled or half-closed idle hands (typing, phone, chin on hand) and back-of-hand Open Palms, then retrain. |
 
 ## F. Facial expressions
 
@@ -137,7 +138,7 @@ Not in the spec. `face_expression.py` finds faces with MediaPipe's face landmark
 are level, crops it, and classifies it with [HSEmotion](https://github.com/sb-ai-lab/EmotiEffLib)'s
 EfficientNet-B0 (`enet_b0_8_best_afew`, trained on AffectNet, Apache-2.0) through OpenCV's DNN module. This adds
 no new dependency. Probabilities are averaged over time per face (0.3 s time constant), and a face gets no label
-while no expression is at least 50% likely. The labels name the expression a face shows, not what the person feels.
+while no expression is at least 40% likely (50% before F10). The labels name the expression a face shows, not what the person feels.
 
 **Choice of engine.** Mean per-expression accuracy (chance 14–17%), before any of the changes below:
 
@@ -165,7 +166,7 @@ photos and 99.7% of AffectNet's). Run `tools/evaluate_faces.py` to reproduce the
 | Disgusted | 47% | 47% | 73% |
 | **Mean** | **69.5%** | **70.6%** | **66.6%** |
 
-At the 50% cut-off, 81% of RAF-DB test faces get a label and 85% of those labels are right (78% with no cut-off).
+At the 40% cut-off (F10), 92.5% of RAF-DB test faces get a label and 81% of those labels are right (at 50%: 81% and 85%; 78% with no cut-off).
 The share of faces shown, and how often the shown label is right, at each cut-off is printed by the evaluator.
 
 | # | Finding | Status |
@@ -174,10 +175,12 @@ The share of faces shown, and how often the shown label is right, at each cut-of
 | F2 | The network has an 8th class, **contempt**: AffectNet's least reliable class, and RAF-DB has no contempt photos to measure it. | **Resolved**: dropped, and the other seven renormalised. |
 | F3 | **The network calls a resting face Angry** about one time in five (RAF-DB 20%, AffectNet 15%), and on RAF-DB it calls Surprised faces Fearful (46%) and Disgusted faces Angry (51%). | **Improved**: per-expression offsets added to the network's scores (`CLASS_OFFSETS`): RAF-DB test 65.7% → 70.6% (+4.9 points, 95% bootstrap interval +3.2 to +6.7), resting faces read as Angry 20% → 8% (AffectNet 15% → 5%), Surprised 32% → 53%. Costs: Angry recall 88% → 79% (AffectNet 72% → 57%), Fearful 74% → 66% (75% → 58%). |
 | F4 | **RAF-DB and AffectNet disagree on Surprised vs. Fearful.** Offsets fitted to RAF-DB alone reached 71.9% on its test split but dropped AffectNet from 66% to 58% (Fearful 75% → 35%). | **Resolved**: offsets are fitted on RAF-DB train and half of AffectNet together (`tools/fit_expression_offsets.py`); the unseen AffectNet half stays level (65.9% → 65.7%). |
-| F5 | With the offsets, **AffectNet's resting faces read as Surprised 21%** of the time (16% before), so on that dataset part of the false Angry moved to Surprised. | **Open**: check with live takes. |
+| F5 | With the offsets, **AffectNet's resting faces read as Surprised 21%** of the time (16% before), so on that dataset part of the false Angry moved to Surprised. The first live check agrees: a resting face at the webcam (5 s, 134 frames, one person) read Surprised in 17% of frames, Neutral in 28%, and nothing in the rest. | **Open**: record resting-face takes (F9) and refit. |
 | F6 | **Disgusted is the weakest expression** (47% on RAF-DB; mostly read as Angry) and Surprised is still read as Fearful 27% of the time on RAF-DB. | **Open** |
 | F7 | The crop margin matters: crops 1.0× the landmarks' extent scored best of 0.8–1.4 (67.1% vs. 66.0% at 1.1 and 61.6% at 1.4, on about 1,780 train faces, before F3). | **Resolved**: 1.0. |
 | F8 | Speed: the face landmarker and network add about 12 ms per frame for one face (6.5 → 18.8 ms per 720p frame on an Apple M5, drawing included). | **Resolved**: one face by default (`--max-faces`); `f` or `--no-faces` turns faces off. |
+| F9 | **The offsets come from other people's photos.** `tools/record_samples.py` records expression takes (letter keys; only the network's scores are kept, with the app's offsets removed, in `samples/faces/`), and `tools/fit_expression_offsets.py` adds them as a third set weighted like each dataset; each expression's takes alternate between fitting and checking. First live session (2026-10-17, one person, 11 takes: Neutral 4, Happy 3, Surprised 2, Sad 2): the current offsets already pick the right expression in 95.9% of held-out frames (resting face 90-100% Neutral; the 17% Surprised of F5 did not recur). A refit scored 93.6% on the held-out takes and cost 2.5 points on RAF-DB test. | **Resolved**: offsets kept. What fell short live was confidence, not the choice of expression (F10). |
+| F10 | **At the 50% cut-off, correctly read faces got no label**: the resting face's top probability was 0.49-0.60 (no label in 7-56% of frames), Sad's 0.39-0.41 (never shown). | **Resolved**: cut-off lowered to 40%. Labelled resting-face frames 44-93% -> 87-100%; RAF-DB test: shown 80.8% -> 92.5%, right 85% -> 81%. Sad is still shown in only 20-26% of frames. |
 
 ## G. Hands and faces together
 
@@ -215,7 +218,7 @@ changing identity.
 
 ## Not verified
 
-- **A live webcam run.** This terminal has no camera permission, so the loop and the sample recorder were tested with a fake camera that replays photos.
+- **A live webcam run.** The terminal can open the camera. The sample recorder ran live (17 takes, about 15 fps with drawing; E6, F9, F10); the app's own window and keys have not been tried live.
 - **Live Left/Right labels.** Handedness is verified on photos, raw and mirrored, but not on a live mirrored webcam feed.
 - **Spider-Man / ILY on real hands.** The other gestures are measured on real photos (section D), but there is no ILY photo set with ground truth.
 - **All gestures, the learned model and the "no gesture" gate on a live webcam.** Sections D and E come from still photos of distant hands.

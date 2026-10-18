@@ -12,7 +12,7 @@ MediaPipe Tasks and OpenCV. It tracks up to two hands and works at any hand rota
   model (trained on HaGRID photos) is more accurate on hard shapes and recognises a hand that is *not* making
   a gesture, whose label is then hidden. Press `m` to compare with the rules alone.
 - **Facial expressions:** Neutral, Happy, Sad, Surprised, Angry, Disgusted, Fearful, shown next to a box
-  around the face. A face gets no label while no expression is at least 50% likely. The labels name what a
+  around the face. A face gets no label while no expression is at least 40% likely. The labels name what a
   face *shows*, not what someone feels. Press `f` to switch them off.
 
 Accuracy on real photos is in [SPEC_NOTES.md](SPEC_NOTES.md#d-gestures-added-after-the-spec-and-accuracy-on-real-photos)
@@ -41,7 +41,7 @@ quits (as does closing the window).
 Options: `--rules-only` starts with the gesture model off; `--min-detection 0.5` makes hand detection stricter if
 phantom hands appear (default 0.3); `--no-faces` skips facial expressions entirely (the face models are not
 loaded); `--max-faces 2` reads more than one face (each adds about 12 ms per frame);
-`--min-expression-confidence 0.7` shows fewer but more reliable expressions (default 0.5).
+`--min-expression-confidence 0.7` shows fewer but more reliable expressions (default 0.4).
 
 Three models are downloaded to `models/` on first run and checked against pinned SHA-256 sums: the hand model
 (~7.8 MB), the face landmark model (~3.8 MB) and the expression network (~16 MB,
@@ -60,8 +60,9 @@ then restart the terminal.
   over time, and the face pipeline.
 - `hand_gesture_tracker.py`: model downloads, the hand pipeline, drawing, and the camera loop.
 - `tools/evaluate_hagrid.py`, `tools/evaluate_faces.py`: measure accuracy on real photos (see below).
-- `tools/fit_expression_offsets.py`: refits the expression network's per-class offsets.
-- `tools/train_gesture_model.py`, `tools/record_samples.py`: retrain the model, optionally on your own hands.
+- `tools/fit_expression_offsets.py`: refits the expression network's per-class offsets, optionally on your own face.
+- `tools/train_gesture_model.py`, `tools/record_samples.py`: retrain the model, optionally on your own hands;
+  the recorder also records your face for the offsets.
 - `tools/hagrid_data.py`: reads HaGRID photos from Hugging Face.
 
 ## Tests
@@ -110,3 +111,17 @@ uv pip install -r requirements-train.txt
 Takes are saved in `samples/` (not committed). Training reports accuracy on your own takes separately.
 Record "no gesture" (your hands doing ordinary things) and Open Palm first; with them,
 `--min-none-confidence` can be lowered from its cautious default of 0.8.
+
+The same window records facial expressions (letter keys, shown on the right; `n` is your resting face, the
+one that matters most). Face takes go to `samples/faces/` and keep only the network's scores, no images.
+Refit the expression offsets with them, then copy the printed `CLASS_OFFSETS` into `face_expression.py`
+if the check rows (your held-out takes and the public test sets) improve:
+
+```bash
+uv pip install -r requirements-eval.txt
+C=tools/.cache/faces   # the network's scores on the public photos, saved once:
+.venv/bin/python tools/evaluate_faces.py --no-offsets --save $C/rafdb_train.npz
+.venv/bin/python tools/evaluate_faces.py --no-offsets --split test --save $C/rafdb_test.npz
+.venv/bin/python tools/evaluate_faces.py --no-offsets --dataset affectnet --save $C/affectnet_val.npz
+.venv/bin/python tools/fit_expression_offsets.py
+```

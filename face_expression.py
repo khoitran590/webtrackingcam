@@ -50,7 +50,7 @@ LEFT_EYE = (263, 362)
 # Angry 20% -> 8% (RAF-DB) and 15% -> 5% (AffectNet).
 CLASS_OFFSETS = (-0.9, 0.15, -0.6, -0.1, 0.0, -0.3, 0.25)
 CROP_MARGIN = 1.0  # crop side / landmark extent; 1.0 scored best of 0.8-1.4 on RAF-DB train
-MIN_CONFIDENCE = 0.5  # smoothed probability an expression needs before it is shown
+MIN_CONFIDENCE = 0.4  # smoothed probability an expression needs before it is shown (see SPEC_NOTES F10)
 SMOOTHING_SECONDS = 0.3  # time constant of the moving average over a face's probabilities
 
 

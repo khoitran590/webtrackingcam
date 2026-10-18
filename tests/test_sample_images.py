@@ -5,6 +5,7 @@ The model and images are downloaded on first run into models/ and tests/.cache/.
 
 import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
 
 import certifi
 import cv2
@@ -444,6 +445,7 @@ def test_recorder_records_a_take_that_training_can_read(model_path, headless, tm
         frames = record_samples.record(FakeCapture([(True, frame.copy()) for _ in range(20)]),
                                        GesturePipeline(landmarker), recorder, max_frames=20, clock=lambda: next(ticks))
     assert frames == 20 and len(recorder.saved) == 1
+    assert recorder.reports == ["TAKE fist: 8 hands kept from 8 frames; app showed: Fist 100%"]
     rows = record_samples.load_takes(tmp_path)[recorder.saved[0]]
     assert len(rows) == 8  # 4 s at 2 frames per second, one hand per frame
     assert {r["class"] for r in rows} == {"fist"} and all(len(r["points_px"]) == len(r["world"]) == 21 for r in rows)
@@ -464,3 +466,50 @@ def test_recorder_ignores_new_keys_while_recording(tmp_path, monkeypatch):
     recorder.start("fist", 0.0)
     recorder.start("palm", 1.0)
     assert recorder.cls == "fist" and recorder.started == 0.0
+
+
+def test_face_takes_recover_the_networks_scores_and_refit_the_offsets(tmp_path, monkeypatch):
+    """Expression takes go to samples/faces/, store the network's scores without the app's offsets,
+    and fit_expression_offsets learns from them: a resting face the network calls Surprised is
+    read as Neutral after refitting, on takes held out from the fit."""
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parent.parent / "tools"))
+    import fit_expression_offsets
+    import record_samples
+    from face_expression import CLASS_OFFSETS, EXPRESSIONS, softmax
+
+    rng = np.random.default_rng(0)
+    neutral, surprise = EXPRESSIONS.index("neutral"), EXPRESSIONS.index("surprise")
+    offsets = np.asarray(CLASS_OFFSETS)
+    empty = SimpleNamespace(hands=[])
+    networks = []
+    for take in range(4):
+        recorder = record_samples.Recorder(tmp_path, countdown=0.0, duration=1.0)
+        recorder.start("neutral", 0.0)
+        for i in range(10):
+            network = rng.normal(0, 0.1, len(EXPRESSIONS))
+            network[surprise] += 2.0  # this person's resting face looks surprised to the network
+            network[neutral] += 1.5
+            networks.append(network)
+            seen = softmax(network + offsets)  # what the app's ExpressionModel returns
+            covered = SimpleNamespace(raw_probabilities=None, expression=None, covered=("lips",))
+            face = SimpleNamespace(raw_probabilities=seen, expression="Surprised", covered=())
+            assert recorder.update(empty, (640, 480), i * 0.1, [face, covered]).startswith("RECORDING neutral")
+        recorder.update(empty, (640, 480), 1.5)
+        assert recorder.saved[0].parent == tmp_path / "faces"
+        rows = record_samples.load_takes(tmp_path / "faces")[recorder.saved[0]]
+        assert len(rows) == 10  # the covered face is skipped
+        assert recorder.reports[0].startswith("TAKE neutral: 10 faces kept from 10 frames; app showed: Surprised 50%, covered 50%")
+        assert "WARNING: a hand covered the face in 100% of frames" in recorder.reports[0]
+    assert record_samples.takes_per_class(tmp_path) == {"neutral": 4}
+    assert record_samples.load_takes(tmp_path) == {}  # gesture training does not see face takes
+
+    fitting, checking = fit_expression_offsets.load_mine(tmp_path / "faces")
+    assert len(fitting[0]) == len(checking[0]) == 20
+    # Stored scores are the network's own log-probabilities: the app's offsets are removed.
+    stored = np.concatenate([fitting[1], checking[1]])
+    expected = np.log(softmax(np.array(networks)))
+    assert np.allclose(stored[np.argsort(stored[:, 0])], expected[np.argsort(expected[:, 0])], atol=1e-4)
+    assert np.all(fitting[1].argmax(axis=1) == surprise)
+    refit = fit_expression_offsets.fit([fitting], passes=2)
+    assert np.mean((checking[1] + refit).argmax(axis=1) == neutral) == 1.0
+    assert np.isnan(fit_expression_offsets.per_expression(checking, refit)[surprise])  # not recorded, not scored
